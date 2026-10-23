@@ -1,0 +1,6 @@
+# 模拟宝塔面板的目录布局：Nginx 在 /www/server/nginx，站点日志在 /www/wwwlogs。
+# 这里的 Nginx 实际是系统的 Nginx，只用来测试 protect.sh 能否识别宝塔并读取它的日志。
+FROM waf-lab/test-debian12
+RUN mkdir -p /www/server/panel /www/server/nginx/sbin /www/wwwlogs \
+	&& ln -s /usr/sbin/nginx /www/server/nginx/sbin/nginx \
+	&& sed -i 's|access_log .*;|access_log /www/wwwlogs/default.log;|' /etc/nginx/nginx.conf

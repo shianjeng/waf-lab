@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# WAF 对比实验室的入口。所有测试请求只发给本机的实验室容器。
+set -euo pipefail
+cd "$(dirname "$0")"
+
+SAFELINE=(docker compose --project-directory safeline -f safeline/compose.yaml)
+
+usage() {
+	cat <<'EOF'
+用法：./waflab <命令>
+
+  run        启动实验室，跑完整对比，结果写到 reports/index.html
+  smoke      只跑冒烟测试，几秒钟出结果
+  safeline   另外启动雷池（需要在它的控制台里手动添加站点）
+  down       停止所有容器，保留数据
+  clean      停止所有容器并删除数据
+EOF
+}
+
+need_docker() {
+	if ! docker info >/dev/null 2>&1; then
+		echo "Docker 没有运行。先启动 Docker Desktop、OrbStack 或 Colima。" >&2
+		exit 1
+	fi
+}
+
+up() {
+	need_docker
+	scripts/init.sh
+	if ! docker image inspect bunkerity/bunkerweb-all-in-one:1.6.17 >/dev/null 2>&1; then
+		echo "首次运行需要下载约 4GB 镜像并构建两个 Caddy 插件，大概要 5 到 10 分钟。"
+	fi
+	docker compose up -d --build --wait
+}
+
+show_report() {
+	echo
+	echo "对比结果：$PWD/reports/index.html"
+	# 只在终端里交互运行时自动打开浏览器
+	if [ -t 1 ] && command -v open >/dev/null 2>&1; then
+		open reports/index.html
+	fi
+}
+
+case "${1:-}" in
+run)
+	up
+	python3 scripts/smoke.py
+	echo
+	scripts/bench.sh
+	show_report
+	;;
+smoke)
+	up
+	python3 scripts/smoke.py -v
+	;;
+safeline)
+	up
+	"${SAFELINE[@]}" up -d
+	echo "等待雷池管理服务就绪..."
+	for _ in $(seq 1 60); do
+		[ "$(docker inspect -f '{{.State.Health.Status}}' safeline-mgt 2>/dev/null)" = healthy ] && break
+		sleep 3
+	done
+	docker exec safeline-mgt resetadmin
+	cat <<'EOF'
+
+接下来在浏览器里完成一步：
+  1. 打开 https://localhost:9443，用上面的用户名和密码登录（证书是自签名的，继续访问即可）
+  2. 添加防护应用：端口 8004，不用 SSL，域名填 *，上游服务器填 http://backend:80
+  3. 回到终端运行 ./waflab run，雷池会出现在对比结果里
+EOF
+	;;
+down)
+	"${SAFELINE[@]}" down 2>/dev/null || true
+	docker compose down
+	;;
+clean)
+	"${SAFELINE[@]}" down -v 2>/dev/null || true
+	docker compose down -v
+	;;
+*)
+	usage
+	;;
+esac

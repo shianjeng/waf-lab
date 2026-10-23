@@ -1,0 +1,12 @@
+source: appsec
+name: waf-lab-appsec
+# 只在 waflab 内部网络监听，没有映射到宿主机
+listen_addr: 0.0.0.0:7422
+# 默认只有 1 个检测线程，测试时 10 个并发连接会让一部分请求超时返回 500，
+# 那是处理能力问题，不是检测能力，所以开到 4 个
+routines: 4
+appsec_configs:
+  - crowdsecurity/appsec-default # 虚拟补丁 + 通用规则，拦截模式
+  - crowdsecurity/crs-inband # OWASP CRS，拦截模式（appsec-crs 只告警不拦截）
+labels:
+  type: appsec

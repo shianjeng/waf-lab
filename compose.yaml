@@ -1,0 +1,103 @@
+# WAF 对比实验室：同一个后端，前面分别挡四种 WAF，用同一套流量去测。
+#
+#   9000  后端直连（不经过 WAF，作对照组）
+#   9001  Coraza + OWASP CRS（跑在 Caddy 里）
+#   9002  CrowdSec AppSec（Caddy bouncer + 虚拟补丁 + CRS 拦截模式）
+#   9003  BunkerWeb（ModSecurity + OWASP CRS）
+#   9004  雷池 SafeLine（单独启动，见 safeline/compose.yaml）
+#
+# 端口只绑定 127.0.0.1，不暴露到局域网（后端本身没有任何防护）。
+# 测试请求只在 waflab-test 网络里发送。这个网络没有外网出口，测试工具就算
+# 被改了目标地址，也发不到实验室以外的地方。
+# 所有 WAF 都用默认的检测强度（CRS 为 paranoia level 1），不额外调优。
+
+name: waf-lab
+
+networks:
+  # WAF 和后端之间的网络，可以访问外网（CrowdSec 启动时要下载规则）
+  waflab:
+    name: waflab
+  # 测试工具所在的网络，没有外网出口
+  waflab-test:
+    name: waflab-test
+    internal: true
+
+volumes:
+  crowdsec-config:
+  crowdsec-data:
+  bunkerweb-data:
+
+services:
+  backend:
+    image: traefik/whoami:v1.12.0
+    networks: [waflab, waflab-test]
+    ports: ["127.0.0.1:9000:80"]
+
+  coraza:
+    build: ./coraza
+    image: waf-lab/coraza-caddy
+    volumes:
+      - ./coraza/Caddyfile:/etc/caddy/Caddyfile:ro
+    networks: [waflab, waflab-test]
+    ports: ["127.0.0.1:9001:8080"]
+    depends_on: [backend]
+
+  crowdsec:
+    image: crowdsecurity/crowdsec:v1.8.1
+    environment:
+      COLLECTIONS: >-
+        crowdsecurity/appsec-virtual-patching
+        crowdsecurity/appsec-generic-rules
+        crowdsecurity/appsec-crs-inband
+      BOUNCER_KEY_caddy: ${CROWDSEC_BOUNCER_KEY:?先运行 ./waflab run}
+      # 实验室不需要连 CrowdSec 中央 API，也不上报任何数据
+      DISABLE_ONLINE_API: "true"
+    volumes:
+      - crowdsec-config:/etc/crowdsec
+      - crowdsec-data:/var/lib/crowdsec/data
+      - ./crowdsec/appsec.yaml:/etc/crowdsec/acquis.d/appsec.yaml:ro
+    networks: [waflab]
+    healthcheck:
+      test: ["CMD", "cscli", "lapi", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  crowdsec-caddy:
+    build: ./crowdsec
+    image: waf-lab/crowdsec-caddy
+    environment:
+      CROWDSEC_BOUNCER_KEY: ${CROWDSEC_BOUNCER_KEY:?先运行 ./waflab run}
+    volumes:
+      - ./crowdsec/Caddyfile:/etc/caddy/Caddyfile:ro
+    networks: [waflab, waflab-test]
+    ports: ["127.0.0.1:9002:8080"]
+    depends_on:
+      backend:
+        condition: service_started
+      crowdsec:
+        condition: service_healthy
+
+  bunkerweb:
+    image: bunkerity/bunkerweb-all-in-one:1.6.17
+    environment:
+      SERVICE_UI: "no"
+      SERVER_NAME: "localhost bunkerweb"
+      USE_REVERSE_PROXY: "yes"
+      REVERSE_PROXY_HOST: "http://backend"
+      REVERSE_PROXY_URL: "/"
+      # 只比较 ModSecurity + CRS 本身。下面这些默认开启的功能会封掉测试机的 IP、
+      # 限速，或者把数据发到外部，都关掉。
+      USE_BAD_BEHAVIOR: "no"
+      USE_LIMIT_REQ: "no"
+      USE_LIMIT_CONN: "no"
+      USE_BLACKLIST: "no"
+      USE_DNSBL: "no"
+      USE_WHITELIST: "no"
+      USE_BUNKERNET: "no"
+      SEND_ANONYMOUS_REPORT: "no"
+    volumes:
+      - bunkerweb-data:/data
+    networks: [waflab, waflab-test]
+    ports: ["127.0.0.1:9003:8080"]
+    depends_on: [backend]

@@ -1,0 +1,10 @@
+# 带 systemd 的测试机，模拟一台装了 Nginx 的 Debian/Ubuntu 服务器
+ARG BASE=debian:12
+FROM ${BASE}
+ENV container=docker DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+		systemd systemd-sysv dbus curl ca-certificates gnupg nginx nftables iproute2 procps \
+	&& rm -rf /var/lib/apt/lists/* \
+	&& systemctl enable nginx
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

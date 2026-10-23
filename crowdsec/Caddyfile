@@ -1,0 +1,17 @@
+{
+	admin off
+	crowdsec {
+		api_url http://crowdsec:8080
+		api_key {$CROWDSEC_BOUNCER_KEY}
+		appsec_url http://crowdsec:7422
+	}
+}
+
+:8080 {
+	# 先查 IP 封禁决定，再把请求交给 AppSec 检测，都放行才转发到后端
+	route {
+		crowdsec
+		appsec
+		reverse_proxy backend:80
+	}
+}

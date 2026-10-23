@@ -1,0 +1,4 @@
+# 带 systemd 的测试机，模拟一台装了 Nginx 的 Rocky Linux 9 服务器
+FROM rockylinux/rockylinux:9-ubi-init
+RUN dnf install -y nginx nftables procps-ng iproute && dnf clean all && systemctl enable nginx
+CMD ["/sbin/init"]

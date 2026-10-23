@@ -1,0 +1,5 @@
+.env
+safeline/.env
+reports/*
+!reports/.gitkeep
+__pycache__/

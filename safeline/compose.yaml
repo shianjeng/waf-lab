@@ -1,0 +1,192 @@
+# 雷池 SafeLine 社区版，改编自官方 compose
+# （https://waf-ce.chaitin.cn/release/latest/compose.yaml，2026-10 版本）。
+#
+# 和官方版本的区别，都是为了能在 macOS 的 Docker Desktop 上跑：
+#   1. 数据放在 Docker 命名卷里，不用宿主机目录。官方版本在宿主机目录之间共享
+#      unix socket，macOS 的文件共享对这个支持不可靠。
+#   2. tengine 不用 host 网络（macOS 默认不支持），改为加入 safeline-ce 和
+#      waflab-test 两个网络，站点端口 8004 映射到宿主机的 127.0.0.1:9004。
+#   3. 不挂载宿主机的 /etc/localtime 和 /etc/resolv.conf，让容器用 Docker
+#      自带的 DNS，才能解析到 waflab-test 网络里的 backend。
+#   4. 版本固定为 9.4.3。
+#   5. 去掉了官方文件里的 RIVER_* 和 ENTITLEMENT_* 环境变量。其中
+#      RIVER_CN_CAPABILITY_GATE=off 会让付费功能跳过授权校验，这里按社区版的
+#      内置默认值运行，和另外三个免费 WAF 公平比较。
+#
+# 用项目根目录的 ./waflab safeline 启动，不要直接 docker compose up。
+
+name: waf-lab-safeline
+
+networks:
+  safeline-ce:
+    name: safeline-ce
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - gateway: ${SUBNET_PREFIX:?先运行 ./waflab safeline}.1
+          subnet: ${SUBNET_PREFIX}.0/24
+  waflab-test:
+    external: true
+
+volumes:
+  pg:
+  mgt:
+  run:
+  sock:
+  nginx:
+  nginx-logs:
+  detector:
+  detector-logs:
+  chaos:
+  cache:
+  luigi:
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - NET_RAW
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: 100m
+      max-file: "5"
+
+services:
+  postgres:
+    <<: *hardening
+    container_name: safeline-pg
+    restart: unless-stopped
+    image: ${IMAGE_PREFIX}/safeline-postgres${ARCH_SUFFIX}:15.18
+    volumes:
+      - pg:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=safeline-ce
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?先运行 ./waflab safeline}
+    networks:
+      safeline-ce:
+        ipv4_address: ${SUBNET_PREFIX}.2
+    command: [postgres, -c, max_connections=600]
+    healthcheck:
+      test: pg_isready -U safeline-ce -d safeline-ce
+
+  mgt:
+    <<: [*hardening, *logging]
+    container_name: safeline-mgt
+    restart: unless-stopped
+    image: ${IMAGE_PREFIX}/safeline-mgt${ARCH_SUFFIX}:${IMAGE_TAG}
+    volumes:
+      - mgt:/app/data
+      - nginx-logs:/app/log/nginx
+      - sock:/app/sock
+      - run:/app/run
+    ports:
+      - 127.0.0.1:${MGT_PORT:-9443}:1443
+    healthcheck:
+      test: curl -k -f https://localhost:1443/api/open/health
+    environment:
+      - MGT_PG=postgres://safeline-ce:${POSTGRES_PASSWORD}@safeline-pg/safeline-ce?sslmode=disable
+      - SUBNET_PREFIX=${SUBNET_PREFIX}
+      - MGT_INTERNAL_TOKEN=${MGT_INTERNAL_TOKEN}
+      - DETECTOR_AES_KEY=${DETECTOR_AES_KEY}
+    depends_on:
+      - postgres
+      - fvm
+    networks:
+      safeline-ce:
+        ipv4_address: ${SUBNET_PREFIX}.4
+
+  detect:
+    <<: [*hardening, *logging]
+    container_name: safeline-detector
+    restart: unless-stopped
+    image: ${IMAGE_PREFIX}/safeline-detector${ARCH_SUFFIX}:${IMAGE_TAG}
+    volumes:
+      - detector:/resources/detector
+      - detector-logs:/logs/detector
+    environment:
+      - LOG_DIR=/logs/detector
+      - DETECTOR_AES_KEY=${DETECTOR_AES_KEY}
+      - DETECTOR_MGMT_TOKEN=${DETECTOR_MGMT_TOKEN}
+      - DETECTOR_MGMT_AUTH=on
+      - DETECTOR_UPDATE_VERIFY=on
+      - DETECTOR_UPDATE_PUBLIC_KEY=
+    networks:
+      safeline-ce:
+        ipv4_address: ${SUBNET_PREFIX}.5
+
+  tengine:
+    <<: *logging
+    container_name: safeline-tengine
+    restart: unless-stopped
+    image: ${IMAGE_PREFIX}/safeline-tengine${ARCH_SUFFIX}:${IMAGE_TAG}
+    volumes:
+      - nginx:/etc/nginx
+      - detector:/resources/detector
+      - chaos:/resources/chaos
+      - nginx-logs:/var/log/nginx
+      - cache:/usr/local/nginx/cache
+      - sock:/app/sock
+    environment:
+      - TCD_MGT_API=https://${SUBNET_PREFIX}.4:1443/api/open/publish/server
+      - TCD_SNSERVER=${SUBNET_PREFIX}.5:8000
+      - SNSERVER_ADDR=${SUBNET_PREFIX}.5:8000
+      - CHAOS_ADDR=${SUBNET_PREFIX}.10
+      - TCD_MGT_TOKEN=${MGT_INTERNAL_TOKEN}
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nofile: 131072
+    networks:
+      safeline-ce:
+        ipv4_address: ${SUBNET_PREFIX}.20
+      waflab-test:
+        aliases: [safeline]
+    ports:
+      - "127.0.0.1:9004:8004"
+
+  luigi:
+    <<: [*hardening, *logging]
+    container_name: safeline-luigi
+    restart: unless-stopped
+    image: ${IMAGE_PREFIX}/safeline-luigi${ARCH_SUFFIX}:${IMAGE_TAG}
+    environment:
+      - MGT_IP=${SUBNET_PREFIX}.4
+      - LUIGI_PG=postgres://safeline-ce:${POSTGRES_PASSWORD}@safeline-pg/safeline-ce?sslmode=disable
+      - DETECTOR_MGMT_TOKEN=${DETECTOR_MGMT_TOKEN}
+    volumes:
+      - luigi:/app/data
+    depends_on:
+      - detect
+      - mgt
+    networks:
+      safeline-ce:
+        ipv4_address: ${SUBNET_PREFIX}.7
+
+  fvm:
+    <<: [*hardening, *logging]
+    container_name: safeline-fvm
+    restart: unless-stopped
+    image: ${IMAGE_PREFIX}/safeline-fvm${ARCH_SUFFIX}:${IMAGE_TAG}
+    environment:
+      - DETECTOR_MGMT_TOKEN=${DETECTOR_MGMT_TOKEN}
+    networks:
+      safeline-ce:
+        ipv4_address: ${SUBNET_PREFIX}.8
+
+  chaos:
+    <<: [*hardening, *logging]
+    container_name: safeline-chaos
+    restart: unless-stopped
+    image: ${IMAGE_PREFIX}/safeline-chaos${ARCH_SUFFIX}:${IMAGE_TAG}
+    environment:
+      - DB_ADDR=postgres://safeline-ce:${POSTGRES_PASSWORD}@safeline-pg/safeline-ce?sslmode=disable
+    volumes:
+      - sock:/app/sock
+      - chaos:/app/chaos
+    networks:
+      safeline-ce:
+        ipv4_address: ${SUBNET_PREFIX}.10

@@ -1,0 +1,18 @@
+{
+	admin off
+	order coraza_waf first
+}
+
+:8080 {
+	# CRS 规则已经编译进插件，load_owasp_crs 之后用 @ 路径引用
+	coraza_waf {
+		load_owasp_crs
+		directives `
+			Include @coraza.conf-recommended
+			Include @crs-setup.conf.example
+			Include @owasp_crs/*.conf
+			SecRuleEngine On
+		`
+	}
+	reverse_proxy backend:80
+}
