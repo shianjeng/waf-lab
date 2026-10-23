@@ -1,11 +1,199 @@
-# 网站防护工具箱
+# WAF Toolkit
+
+English | [中文](#中文说明)
+
+Two tools for protecting websites. Neither one sends attack traffic to any outside website.
+
+| Tool | What it does | Where it runs |
+|---|---|---|
+| [`protect/protect.sh`](#one-click-protection-protectsh) | Puts a WAF in front of the websites on your own server with one command, and lets you allow a wrongly blocked request with one command | Your Linux server |
+| [`./waflab`](#waf-comparison-lab-waflab) | Compares open-source WAFs side by side: how many attacks each blocks and how often it blocks legitimate traffic | Your computer (needs Docker) |
+
+---
+
+## One-click protection: protect.sh
+
+Copy `protect/protect.sh` to your server and run:
+
+```bash
+sudo bash protect.sh
+```
+
+It first lists what it is going to do and only starts after you confirm. The script's messages are in Chinese; translated, they look like this:
+
+```
+This will do the following on this server:
+  System: Ubuntu 24.04 LTS · Web server: Nginx 1.24.0
+  Protection level: full (requests are checked before they reach the site; attacks get a 403)
+
+  1. Add the official CrowdSec package repository and install CrowdSec
+  2. Install the Nginx component and enable virtual patching and generic attack rules
+  3. Install the firewall component to ban IPs that attack the site or brute-force SSH
+  4. Add these IPs to the allowlist so they are never banned: 198.51.100.7
+```
+
+Protection comes from [CrowdSec](https://www.crowdsec.net). Step 4 finds the IP you are logged in over SSH from and allowlists it, so a few mistyped passwords can't lock you out of your own server.
+
+### Two protection levels
+
+| Server | Level | What it does |
+|---|---|---|
+| Debian, Ubuntu, with Nginx from the system repositories | Full | Checks each request before it reaches the site and answers attacks with a 403; also bans attacking IPs based on the logs |
+| CentOS, Rocky, AlmaLinux, Alibaba Cloud Linux | Basic | Reads the Nginx logs and bans scanning and attacking IPs at the firewall; Nginx is not changed |
+| BaoTa (宝塔) panel | Basic | Same as above, reading the site logs in `/www/wwwlogs` |
+
+In basic mode an attacker's first few requests still reach the site. CrowdSec bans the IP within seconds of recognizing the attack. The Nginx builds on CentOS-family systems and in BaoTa lack the Lua module that CrowdSec's official Nginx component needs, which is why they get basic mode.
+
+Both levels also protect SSH against brute-force attacks.
+
+### When a legitimate user gets blocked
+
+```bash
+sudo bash protect.sh --blocks
+```
+
+Translated output:
+
+```
+Recently blocked requests (newest first):
+
+  [2] 10-23 17:15  203.0.113.20  GET /search?q=zsh%20is%20the%20best%21
+       Reason: Remote Command Execution: Direct Unix Command Execution
+
+  [1] 10-23 17:15  203.0.113.9  GET /.env
+       Reason: Detect access to .env files
+
+Was a legitimate user blocked? Enter a number to allow it (Enter to quit): 2
+
+This block matched 1 rule. Allow it:
+  1. Only on the path /search (recommended)
+  2. Site-wide
+Choose [1/2]: 1
+Allowed 1 rule on /search (1 new exception). Other paths are still checked.
+```
+
+An exception only covers the rules that fired for that block. Other attacks on the same path, such as XSS or command injection, are still blocked.
+
+| Option | What it does |
+|---|---|
+| `--blocks` | List recent blocks and allow one by number |
+| `--allow-block ID` | Allow a block without prompts; add `--site-wide` to allow it everywhere |
+| `--unban IP` | Lift a ban on an IP, and optionally allowlist it |
+| `--reset-exceptions` | Remove all exceptions |
+| `--status` | Show whether protection is running and the latest attacks |
+| `--strict` | At install time, also enable the OWASP CRS rules: more attacks blocked, but more false positives too (see the lab results below) |
+| `--allow-ip IP` | At install time, allowlist an extra IP |
+| `--uninstall` | Remove everything |
+
+### Good to know
+
+- **It only protects.** The one test request it makes is a single request for `/.env` to `127.0.0.1` at the end of the install, to confirm that blocking works.
+- **CrowdSec shares data with its community by default.** It sends the IPs and attack types it detects to the CrowdSec community and downloads the community blocklist in return. To opt out, see the [CrowdSec documentation](https://docs.crowdsec.net) on disabling the Central API.
+- **Servers in mainland China** download from CrowdSec's overseas package repository, which can be slow.
+- **The default rules are conservative.** By default only virtual patches for known vulnerabilities and a few generic rules are enabled. They rarely block legitimate traffic, but generic attacks such as path traversal need `--strict`.
+- **Tested on** servers simulated in Docker (see `protect/test/run.sh`): Debian 12, Ubuntu 24.04, Rocky Linux 9, and Debian 12 set up with BaoTa's directory layout. **It has not been verified on a real BaoTa panel yet.**
+
+### Tests
+
+```bash
+protect/test/run.sh            # simulate 5 servers in Docker: install, blocking, false positives, uninstall
+protect/test/run.sh rocky9     # just one
+```
+
+The "attacker" in the tests is a few made-up lines written straight into the test server's log file, using IP addresses reserved for documentation. The tests send no attack traffic over the network.
+
+---
+
+## WAF comparison lab: waflab
+
+Four open-source WAFs sit in front of the same backend and get the same test traffic, so you can see which blocks more and which blocks fewer legitimate requests:
+
+| Port | Target | Notes |
+|---|---|---|
+| 9000 | No WAF | The backend directly, as a baseline |
+| 9001 | [Coraza](https://coraza.io) | OWASP CRS 4, running in Caddy |
+| 9002 | [CrowdSec AppSec](https://docs.crowdsec.net/docs/next/appsec/intro) | Virtual patching + generic rules + CRS, the same as protect.sh with `--strict` |
+| 9003 | [BunkerWeb](https://www.bunkerweb.io) | ModSecurity + OWASP CRS 4 |
+| 9004 | [SafeLine (雷池)](https://waf-ce.chaitin.cn) | Chaitin's semantic analysis engine; started and set up separately |
+
+### Running it
+
+You need Docker Desktop (or OrbStack, or Colima); give it 8GB of memory to be safe.
+
+```bash
+./waflab run       # start the lab, run the full comparison, write reports/index.html
+./waflab smoke     # quick smoke test, results in seconds
+./waflab down      # stop, keeping data
+./waflab clean     # stop and delete all data
+```
+
+The first run downloads about 4GB of images and builds two Caddy plugins, which takes 5 to 10 minutes.
+
+### Test traffic never leaves your computer
+
+- Every port is bound to `127.0.0.1`, so other devices on your network can't reach the lab.
+- The full test tool (GoTestWAF) runs on a Docker network, `waflab-test`, that has **no route to the internet** and can only reach the lab's containers. The script checks that the network really is isolated before it runs and refuses to run otherwise.
+- The smoke test only sends requests to `localhost` and refuses to run if a target is anything else.
+
+### Adding SafeLine
+
+SafeLine's protected sites can only be set up in its own web console, so it takes one extra step:
+
+```bash
+./waflab safeline
+```
+
+This starts SafeLine and prints the admin password. Then, as the prompts explain, add an application at <https://localhost:9443> (port `8004`, upstream `http://backend:80`) and run `./waflab run`.
+
+### Keeping it fair
+
+- Every WAF runs at its default detection level; CRS is at paranoia level 1.
+- BunkerWeb's features that aren't WAF rules and would skew the test are turned off: Bad Behavior (which would ban the test client), rate limiting, blocklists, DNSBL, BunkerNet and anonymous reporting.
+- CrowdSec uses `appsec-crs-inband`, so a CRS match blocks the request (`appsec-crs` only alerts and would score 0). It runs 4 detection workers: with the default of 1, the test's concurrency made some requests time out with a 500.
+- SafeLine runs with the community edition's built-in defaults. The official compose file sets `RIVER_CN_CAPABILITY_GATE=off`, which makes paid features skip the license check; this project doesn't set it. Version 9.4.3's startup log shows that the check is off by default even so. That is the vendor's own default; don't turn on paid features in the console when testing.
+
+### Results (2026-10-24)
+
+Apple Silicon, Docker Engine 29.8, GoTestWAF 0.5.8. SafeLine needs its site added by hand and was not tested this time.
+
+| Target | Attacks blocked | Legitimate requests passed | Wrongly blocked |
+|---|---:|---:|---:|
+| No WAF | 0.0% | 100.0% | 0/141 |
+| Coraza | 47.6% | 90.8% | 13/141 |
+| CrowdSec | 47.1% | 79.4% | 29/141 |
+| BunkerWeb | 48.0% | 90.8% | 13/141 |
+
+- Coraza and BunkerWeb both use OWASP CRS underneath. They block almost exactly the same attacks and wrongly block the same sentences, such as `union was a great select` and `zsh is the best!`.
+- CrowdSec (in the strict setup with CRS) blocks about as many attacks but wrongly blocks more than twice as many legitimate requests. The extra false positives come from its own CRS rule package: rule 932260 (Unix command execution), for example, treats an ordinary sentence like `curl and divergence` as a command. That's why protect.sh leaves CRS off by default.
+- BunkerWeb does better than the other two on XML injection (28.6%) and template injection (45.8%).
+- None of the three stops much LDAP injection, mail injection, or RCE in the URL path.
+
+The per-category breakdown is in `reports/index.html`, written by `./waflab run`.
+
+---
+
+## Layout
+
+```
+protect/protect.sh        one-click protection script
+protect/test/             tests for protect.sh on servers simulated in Docker
+waflab                    entry point for the comparison lab
+compose.yaml              backend + Coraza + CrowdSec + BunkerWeb
+coraza/ crowdsec/         builds and configs for the two Caddy plugins
+safeline/compose.yaml     SafeLine, adapted from the official compose file to run on macOS
+scripts/                  test and report scripts for the lab
+```
+
+---
+
+# 中文说明
 
 两个工具，都不会往任何外部网站发送攻击请求：
 
 | 工具 | 用来做什么 | 在哪里运行 |
 |---|---|---|
-| [`protect/protect.sh`](#一键防护-protectsh) | 一条命令给自己服务器上的网站加上 WAF 防护，误拦了正常用户也能一条命令放行 | 你自己的 Linux 服务器 |
-| [`./waflab`](#waf-对比实验室-waflab) | 在本机比较几个开源 WAF 拦得多不多、误报多不多，用来选型 | 你的电脑（需要 Docker） |
+| [`protect/protect.sh`](#一键防护protectsh) | 一条命令给自己服务器上的网站加上 WAF 防护，误拦了正常用户也能一条命令放行 | 你自己的 Linux 服务器 |
+| [`./waflab`](#waf-对比实验室waflab) | 在本机比较几个开源 WAF 拦得多不多、误报多不多，用来选型 | 你的电脑（需要 Docker） |
 
 ---
 
