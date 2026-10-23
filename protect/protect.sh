@@ -10,7 +10,8 @@
 #   sudo bash protect.sh --uninstall   卸载
 #   加 -y 跳过确认
 #
-# 支持 Debian、Ubuntu、CentOS、Rocky、AlmaLinux、阿里云 Linux 上的 Nginx，以及宝塔面板的 Nginx。
+# 支持 Debian、Ubuntu、CentOS、Rocky、AlmaLinux、阿里云 Linux、龙蜥、OpenCloudOS 上的 Nginx，
+# 以及宝塔面板的 Nginx。
 #
 # 两种防护级别：
 #   完整：Debian/Ubuntu 上用系统软件源安装的 Nginx。请求到达网站之前就检测，
@@ -135,12 +136,14 @@ detect_os() {
 	*" rhel "* | *" centos "* | *" fedora "* | *" rocky "* | *" almalinux "* | *" alinux "* | *" anolis "* | *" opencloudos "*)
 		if command -v dnf >/dev/null 2>&1; then PKG=dnf; else PKG=yum; fi
 		;;
-	*) die "暂不支持 $OS_NAME。目前支持 Debian、Ubuntu 和 CentOS/Rocky/AlmaLinux/阿里云 Linux。" ;;
+	*) die "暂不支持 $OS_NAME。目前支持 Debian、Ubuntu 和 CentOS/Rocky/AlmaLinux/阿里云 Linux/龙蜥/OpenCloudOS。" ;;
 	esac
 }
 
 detect_web() {
 	if [ -x /www/server/nginx/sbin/nginx ] || [ -d /www/server/panel ]; then
+		[ -x /www/server/nginx/sbin/nginx ] ||
+			die "检测到宝塔面板，但没有安装 Nginx（可能用的是 Apache 或 OpenLiteSpeed）。目前只支持 Nginx。"
 		WEB=baota
 		NGINX_BIN=/www/server/nginx/sbin/nginx
 		WEB_NAME="宝塔面板的 Nginx"
@@ -172,12 +175,23 @@ pkg_remove() {
 
 add_repo() {
 	command -v curl >/dev/null 2>&1 || pkg_install curl
-	if [ "$PKG" = apt ] && [ ! -f /etc/apt/sources.list.d/crowdsec_crowdsec.list ]; then
-		curl -fsSL https://install.crowdsec.net | sh >/dev/null
-		apt-get update -qq >/dev/null
-	elif [ "$PKG" != apt ] && [ ! -f /etc/yum.repos.d/crowdsec_crowdsec.repo ]; then
-		curl -fsSL https://install.crowdsec.net | sh >/dev/null
+	if [ "$PKG" = apt ] && [ -f /etc/apt/sources.list.d/crowdsec_crowdsec.list ]; then return 0; fi
+	if [ "$PKG" != apt ] && [ -f /etc/yum.repos.d/crowdsec_crowdsec.repo ]; then return 0; fi
+	# 官方安装脚本不认识阿里云 Linux、龙蜥、OpenCloudOS 这些兼容 RHEL 的系统，会直接拒绝。
+	# CrowdSec 的 RPM 软件源对 RHEL 系是通用的，所以让它按 RHEL 处理
+	local override=() out version=${VERSION_ID:-9}
+	if [ "$PKG" != apt ]; then
+		case "${ID:-}" in
+		centos | rhel | fedora | amzn | cloudlinux | almalinux | rocky | ol) ;;
+		*) override=(os=rhel "dist=${version%%.*}") ;;
+		esac
 	fi
+	if ! out=$(curl -fsSL https://install.crowdsec.net | env ${override[@]+"${override[@]}"} sh 2>&1); then
+		printf '%s\n' "$out" | tail -n 8 >&2
+		die "添加 CrowdSec 软件源失败，原因见上面的输出"
+	fi
+	if [ "$PKG" = apt ]; then apt-get update -qq >/dev/null; fi
+	return 0
 }
 
 # 完整模式需要 Debian/Ubuntu 软件源里的 Nginx Lua 模块。如果装它会替换或删除
@@ -228,6 +242,9 @@ show_plan() {
 		fi
 	else
 		say "  2. 读取 Nginx 日志（${LOG_DESC}），识别扫描、漏洞利用和暴力破解"
+		if [ "$strict" -eq 1 ]; then
+			say "     （--strict 只在完整模式下有效，这台服务器上会忽略它）"
+		fi
 	fi
 	say "  3. 安装防火墙组件，封禁攻击网站和暴力破解 SSH 的 IP"
 	if [ ${#ALLOW_IPS[@]} -gt 0 ]; then
@@ -375,24 +392,44 @@ check() {
 		fi
 	done
 	if [ "${MODE:-}" = full ]; then
+		# 先读进变量再查找：直接接 grep -q 的话，grep 提前退出会让 nginx -T 收到
+		# SIGPIPE，在 pipefail 下被当成失败
+		local conf
+		conf=$(nginx -T 2>/dev/null || true)
+		if [[ "$conf" != *crowdsec* ]]; then
+			say "  [异常] Nginx 没有加载 CrowdSec 防护组件。检查 nginx.conf 里有没有 include /etc/nginx/conf.d/*.conf;"
+			ok=0
+		fi
 		# 只向本机发探测 .env 文件的请求，确认防护已经生效。重新加载后检测组件要
-		# 过几秒才就绪，所以最多等 20 秒
-		local code="" i
+		# 过几秒才就绪，所以最多等 20 秒。先看一眼首页，默认站点如果本来就返回 403，
+		# 就没法用它来确认
+		local base code="" i
+		base=$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1/ || true)
 		for i in $(seq 1 20); do
 			code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1/.env || true)
 			[ "$code" = 403 ] && break
 			sleep 1
 		done
-		if [ "$code" = 403 ]; then
-			say "  [正常] 请求 http://127.0.0.1/.env 被拦截（403）"
+		if [ "$base" = 403 ]; then
+			say "  [未确认] 本机默认站点对所有请求都返回 403，没法用它确认。"
+			say "           可以在浏览器里访问 https://你的域名/.env，看到 CrowdSec 拦截页面就说明生效了。"
+		elif [ "$code" = 403 ]; then
+			say "  [正常] 请求 http://127.0.0.1/.env 被拦截（403），首页正常（$base）"
 		else
 			say "  [未确认] 请求 http://127.0.0.1/.env 返回 $code。如果默认站点会跳转到 HTTPS，这是正常的。"
 			say "           可以在浏览器里访问 https://你的域名/.env，看到 CrowdSec 拦截页面就说明生效了。"
 		fi
 	else
-		local files
-		files=$(cscli metrics show acquisition 2>/dev/null | grep -cE 'file:.*\.log' || true)
-		say "  [正常] 正在分析 ${files:-0} 个 Nginx 日志文件"
+		# 刚装好时还没有新日志，cscli metrics 里看不到文件，所以直接数日志文件
+		local pattern files
+		if [ "${WEB:-nginx}" = baota ]; then pattern="/www/wwwlogs/*.log"; else pattern="/var/log/nginx/*.log"; fi
+		files=$( (compgen -G "$pattern" || true) | wc -l | tr -d ' ')
+		if [ "$files" -gt 0 ]; then
+			say "  [正常] 正在监控 $files 个 Nginx 日志文件（$pattern）"
+		else
+			say "  [异常] 没有找到 Nginx 日志文件（$pattern），基础模式要靠它们发现攻击"
+			ok=0
+		fi
 	fi
 	[ "$ok" -eq 1 ]
 }
@@ -431,10 +468,11 @@ alert_field() {
 		}'
 }
 
-# 最近的网站拦截记录，每行"编号,IP,时间"。reason 字段里可能有逗号，所以从两头取
+# 最近的网站拦截记录，每行"编号,IP,时间"。reason 字段里可能有逗号，所以从两头取。
+# 条数在 awk 里限制，不接 head：head 提前退出会在 pipefail 下让整个脚本中止
 recent_blocks() {
 	cscli alerts list -o raw -l 200 2>/dev/null |
-		awk -F, 'NR > 1 && $NF == "waf" { print $1 "," $3 "," $(NF - 1) }' | head -n 15
+		awk -F, 'NR > 1 && $NF == "waf" && n < 15 { print $1 "," $3 "," $(NF - 1); n++ }'
 }
 
 join_lines() { awk -v sep="$1" 'NR > 1 { printf "%s", sep } { printf "%s", $0 } END { print "" }'; }
@@ -443,7 +481,14 @@ shorten() {
 	if [ ${#1} -gt 80 ]; then printf '%s…' "${1:0:80}"; else printf '%s' "$1"; fi
 }
 
-urldecode() { printf '%b' "${1//%/\\x}"; }
+# 先把路径里原有的反斜杠转义掉，避免 printf %b 把 \n、\c 这类内容当成转义符
+urldecode() {
+	local s=${1//\\/\\\\}
+	printf '%b' "${s//%/\\x}"
+}
+
+# 拦截记录里的内容来自访问者，显示前去掉控制字符，避免干扰终端
+clean() { printf '%s' "$1" | tr -d '\000-\037\177'; }
 
 yaml_quote() { printf "'%s'" "${1//\'/\'\'}"; }
 
@@ -510,9 +555,9 @@ blocks() {
 	fi
 	say "最近被拦截的请求（最新的在前）："
 	while IFS=, read -r id ip time; do
-		uri=$(alert_field "$id" target_uri | head -1)
-		method=$(alert_field "$id" method | head -1)
-		msgs=$(alert_field "$id" msg | join_lines "；")
+		uri=$(clean "$(alert_field "$id" target_uri | head -1)")
+		method=$(clean "$(alert_field "$id" method | head -1)")
+		msgs=$(clean "$(alert_field "$id" msg | join_lines "；")")
 		t=${time:5:11}
 		printf '\n  [%s] %s  %s  %s %s\n' "$id" "${t/T/ }" "$ip" "$method" "$(shorten "$uri")"
 		say "       原因：${msgs:-未知}"
@@ -537,6 +582,15 @@ allow_block() {
 	[ -n "$names" ] || die "读不到这次拦截命中了哪些规则"
 	ip=$(cscli alerts list -o raw -l 200 2>/dev/null | awk -F, -v id="$id" '$1 == id { print $3 }')
 	path=$(urldecode "${uri%%\?*}")
+	case "$path" in
+	/*) ;;
+	*) die "读不到这次请求的路径，不能放行" ;;
+	esac
+	# 路径来自访问者能控制的 URL。解码后如果有换行、制表符等控制字符，写进例外列表
+	# 会被拆成别的行，变成攻击者指定的全站例外，所以直接拒绝
+	if [[ "$path" =~ [[:cntrl:]] ]]; then
+		die "这次请求的路径里有换行等控制字符，很可能是故意构造的攻击请求，不能放行"
+	fi
 	count=$(printf '%s\n' "$names" | grep -c .)
 
 	if printf '%s\n' "$names" | grep -q '^crowdsecurity/vpatch-'; then

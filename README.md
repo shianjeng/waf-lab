@@ -39,10 +39,10 @@ Protection comes from [CrowdSec](https://www.crowdsec.net). Step 4 finds the IP 
 | Server | Level | What it does |
 |---|---|---|
 | Debian, Ubuntu, with Nginx from the system repositories | Full | Checks each request before it reaches the site and answers attacks with a 403; also bans attacking IPs based on the logs |
-| CentOS, Rocky, AlmaLinux, Alibaba Cloud Linux | Basic | Reads the Nginx logs and bans scanning and attacking IPs at the firewall; Nginx is not changed |
+| CentOS, Rocky, AlmaLinux, Alibaba Cloud Linux, Anolis, OpenCloudOS | Basic | Reads the Nginx logs and bans scanning and attacking IPs at the firewall; Nginx is not changed |
 | BaoTa (宝塔) panel | Basic | Same as above, reading the site logs in `/www/wwwlogs` |
 
-In basic mode an attacker's first few requests still reach the site. CrowdSec bans the IP within seconds of recognizing the attack. The Nginx builds on CentOS-family systems and in BaoTa lack the Lua module that CrowdSec's official Nginx component needs, which is why they get basic mode.
+Basic mode can't stop a request before it reaches the site. CrowdSec recognizes the attack in the logs, and the firewall blocks that IP about 10 seconds later, so the attacker's first requests still get through. CentOS-family systems get basic mode because their Nginx packages have no Lua module, which CrowdSec's official Nginx component needs. BaoTa gets it because BaoTa compiles its own Nginx, which that component can't plug into.
 
 Both levels also protect SSH against brute-force attacks.
 
@@ -87,16 +87,17 @@ An exception only covers the rules that fired for that block. Other attacks on t
 
 ### Good to know
 
-- **It only protects.** The one test request it makes is a single request for `/.env` to `127.0.0.1` at the end of the install, to confirm that blocking works.
+- **It only protects.** The only requests it sends to your site are two to `127.0.0.1` at the end of the install, for the home page and for `/.env`, to confirm that blocking works.
+- **It runs CrowdSec's official installer as root.** Step 1 downloads <https://install.crowdsec.net> and runs it to add the package repository, which is the installation method CrowdSec documents. As with any script you run with sudo, read `protect.sh` before running it.
 - **CrowdSec shares data with its community by default.** It sends the IPs and attack types it detects to the CrowdSec community and downloads the community blocklist in return. To opt out, see the [CrowdSec documentation](https://docs.crowdsec.net) on disabling the Central API.
 - **Servers in mainland China** download from CrowdSec's overseas package repository, which can be slow.
 - **The default rules are conservative.** By default only virtual patches for known vulnerabilities and a few generic rules are enabled. They rarely block legitimate traffic, but generic attacks such as path traversal need `--strict`.
-- **Tested on** servers simulated in Docker (see `protect/test/run.sh`): Debian 12, Ubuntu 24.04, Rocky Linux 9, and Debian 12 set up with BaoTa's directory layout. **It has not been verified on a real BaoTa panel yet.**
+- **Tested on** servers simulated in Docker (see `protect/test/run.sh`): Debian 12, Ubuntu 24.04, Rocky Linux 9, Anolis OS 23, and Debian 12 set up with BaoTa's directory layout. Alibaba Cloud Linux and OpenCloudOS take the same path as Anolis but haven't been tested directly. **It has not been verified on a real BaoTa panel yet.**
 
 ### Tests
 
 ```bash
-protect/test/run.sh            # simulate 5 servers in Docker: install, blocking, false positives, uninstall
+protect/test/run.sh            # 6 scenarios on servers simulated in Docker: install, blocking, false positives, uninstall
 protect/test/run.sh rocky9     # just one
 ```
 
@@ -225,10 +226,10 @@ sudo bash protect.sh
 | 服务器 | 防护级别 | 效果 |
 |---|---|---|
 | Debian、Ubuntu，Nginx 从系统软件源安装 | 完整 | 请求到达网站之前就检测，攻击请求直接返回 403；同时按日志封禁攻击者 IP |
-| CentOS、Rocky、AlmaLinux、阿里云 Linux | 基础 | 分析 Nginx 日志，发现扫描和攻击后在防火墙封禁 IP，不改动 Nginx |
+| CentOS、Rocky、AlmaLinux、阿里云 Linux、龙蜥 Anolis、OpenCloudOS | 基础 | 分析 Nginx 日志，发现扫描和攻击后在防火墙封禁 IP，不改动 Nginx |
 | 宝塔面板 | 基础 | 同上，读取 `/www/wwwlogs` 下的站点日志 |
 
-基础模式下，攻击者最先发出的几个请求仍会到达网站，CrowdSec 识别出来以后几秒内封掉它的 IP。CentOS 系列和宝塔的 Nginx 没有 CrowdSec 官方防护组件需要的 Lua 模块，所以只能用基础模式。
+基础模式没法在请求到达网站之前拦住它：CrowdSec 从日志里识别出攻击，大约 10 秒后防火墙封掉这个 IP，所以攻击者最先发出的几个请求仍会到达网站。CentOS 系列用基础模式，是因为它们的 Nginx 软件包没有 CrowdSec 官方防护组件需要的 Lua 模块；宝塔用基础模式，是因为宝塔的 Nginx 是自己编译的，官方防护组件接不进去。
 
 两种模式都会保护 SSH，防止暴力破解。
 
@@ -271,16 +272,17 @@ sudo bash protect.sh --blocks
 
 ### 需要知道的几件事
 
-- **只做防护。** 整个过程只有一个"测试请求"：安装结束时向本机 `127.0.0.1` 请求一次 `/.env`，确认防护已经生效。
+- **只做防护。** 它只会向你的网站发两个请求：安装结束时向本机 `127.0.0.1` 请求首页和 `/.env`，确认防护已经生效。
+- **它会用 root 权限运行 CrowdSec 的官方安装脚本。** 第 1 步会下载 <https://install.crowdsec.net> 并运行它来添加软件源，这是 CrowdSec 文档里的安装方式。和任何要用 sudo 运行的脚本一样，运行前请先看一遍 `protect.sh`。
 - **CrowdSec 默认会和社区共享数据。** 它会把检测到的攻击者 IP 和攻击类型分享给 CrowdSec 社区，同时下载社区黑名单。不想分享可以参考 [CrowdSec 文档](https://docs.crowdsec.net) 关闭 Central API。
 - **国内服务器** 安装时要从 CrowdSec 的国外软件源下载，可能比较慢。
 - **默认规则偏保守。** 默认只启用针对已知漏洞的虚拟补丁和少量通用规则，误报很少，但像路径穿越这种通用攻击要靠 `--strict`。
-- **已测试的环境**（在 Docker 里模拟的服务器上，见 `protect/test/run.sh`）：Debian 12、Ubuntu 24.04、Rocky Linux 9，以及模拟宝塔目录布局的 Debian 12。**还没有在真实的宝塔面板上验证过。**
+- **已测试的环境**（在 Docker 里模拟的服务器上，见 `protect/test/run.sh`）：Debian 12、Ubuntu 24.04、Rocky Linux 9、龙蜥 Anolis OS 23，以及模拟宝塔目录布局的 Debian 12。阿里云 Linux 和 OpenCloudOS 走的是和龙蜥相同的安装路径，但没有直接测试过。**还没有在真实的宝塔面板上验证过。**
 
 ### 测试
 
 ```bash
-protect/test/run.sh            # 在 Docker 里模拟 5 种服务器，跑安装、拦截、误报处理和卸载
+protect/test/run.sh            # 在 Docker 里模拟的服务器上跑 6 个场景：安装、拦截、误报处理和卸载
 protect/test/run.sh rocky9     # 只测一种
 ```
 

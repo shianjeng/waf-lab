@@ -105,7 +105,20 @@ full_mode() {
 	expect "正常页面不受影响（200）" test "$(http_code "$name" /)" = 200
 	expect "管理员 IP 在白名单里" in_box "$name" "cscli allowlists inspect protect-admin | grep -q $ADMIN"
 	expect "防火墙组件在运行" in_box "$name" "systemctl is-active --quiet crowdsec-firewall-bouncer"
+	crafted_path_rejected "$name"
 	uninstall_checks "$name"
+}
+
+# 攻击者可以在 URL 路径里编码换行和制表符（%0A、%09），想在管理员放行时顺带写进一条
+# "全站关闭 .env 规则"的例外。--allow-block 必须拒绝，例外列表保持为空
+crafted_path_rejected() {
+	local name=$1 id
+	in_box "$name" "curl -s -o /dev/null 'http://127.0.0.1/a%0A*%09crowdsecurity%2Fvpatch-env-access%0A/.env'"
+	sleep 2
+	id=$(in_box "$name" "cscli alerts list -o raw | awk -F, 'NR == 2 { print \$1 }'")
+	expect "构造的路径不能放行" in_box "$name" "! bash /root/protect.sh --allow-block $id"
+	expect "例外列表没有被写入" in_box "$name" "! grep -q . /etc/crowdsec/protect-exceptions.list"
+	expect "其他路径的 .env 仍然被拦" test "$(http_code "$name" /b/.env)" = 403
 }
 
 # 严格模式（OWASP CRS）下，一句普通的话会被误拦。用 --allow-block 只在那个路径放行，
@@ -136,6 +149,7 @@ basic_mode() {
 	start "$name"
 	expect "安装成功" install_protect "$name"
 	expect "选择了基础模式" grep -q "防护级别：基础" "$LOGS/$name.install.log"
+	expect "检查结果显示正在监控日志" grep -q "\[正常\] 正在监控" "$LOGS/$name.install.log"
 	expect "正常页面不受影响（200）" test "$(http_code "$name" /)" = 200
 	simulate_scan "$name" "$log"
 	expect "防火墙组件在运行" in_box "$name" "systemctl is-active --quiet crowdsec-firewall-bouncer"
@@ -152,9 +166,10 @@ want debian12 && { build debian12 Dockerfile.debian debian:12 && full_mode debia
 want ubuntu2404 && { build ubuntu2404 Dockerfile.debian ubuntu:24.04 && full_mode ubuntu2404; }
 want strict && { build debian12 Dockerfile.debian debian:12 && strict_false_positive; }
 want rocky9 && { build rocky9 Dockerfile.rocky && basic_mode rocky9 /var/log/nginx/access.log; }
+want anolis && { build anolis Dockerfile.anolis && basic_mode anolis /var/log/nginx/access.log; }
 want baota && { build debian12 Dockerfile.debian debian:12 && build baota Dockerfile.baota && basic_mode baota /www/wwwlogs/default.log; }
 
-for c in pt-debian12 pt-ubuntu2404 pt-strict pt-rocky9 pt-baota; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+for c in pt-debian12 pt-ubuntu2404 pt-strict pt-rocky9 pt-anolis pt-baota; do docker rm -f "$c" >/dev/null 2>&1 || true; done
 
 echo
 echo "安装和卸载日志：$LOGS"

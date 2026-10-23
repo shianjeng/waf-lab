@@ -1,0 +1,5 @@
+# 带 systemd 的测试机，模拟一台装了 Nginx 的龙蜥（Anolis OS）服务器。
+# 阿里云 Linux 和它同源，官方的 CrowdSec 安装脚本都不认识，用来测 protect.sh 的兼容处理
+FROM openanolis/anolisos:23.4
+RUN dnf install -y systemd nginx nftables procps-ng iproute && dnf clean all && systemctl enable nginx
+CMD ["/usr/sbin/init"]
