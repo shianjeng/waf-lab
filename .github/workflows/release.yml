@@ -1,0 +1,55 @@
+name: Release
+
+# 推送 v* 标签时发布 protect.sh：先跑完整测试，再核对版本号，生成 SHA256 校验值和
+# 来源证明，最后创建 GitHub Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/protect.yml
+
+  release:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # 创建 Release
+      id-token: write # 生成来源证明
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check version matches tag
+        run: |
+          version=$(sed -nE 's/^VERSION=([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' protect/protect.sh)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::protect.sh 里的 VERSION=$version 和标签 $GITHUB_REF_NAME 不一致"
+            exit 1
+          fi
+
+      - name: Build release files
+        run: |
+          mkdir dist
+          cp protect/protect.sh dist/
+          cd dist
+          sha256sum protect.sh >SHA256SUMS
+          cat SHA256SUMS
+
+      # 来源证明证明这个文件是由本仓库的这个工作流构建的。私有仓库用不了这个功能
+      - name: Attest provenance
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/protect.sh
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/protect.sh dist/SHA256SUMS \
+            --title "$GITHUB_REF_NAME" --generate-notes --verify-tag

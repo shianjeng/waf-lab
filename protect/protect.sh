@@ -21,6 +21,9 @@
 #         攻击者 IP，不改动 Nginx。最先到达的几个攻击请求仍会到达网站。
 set -euo pipefail
 
+# 发布时打的标签必须是 v$VERSION，发布工作流会检查
+VERSION=0.1.0
+
 STATE=/etc/crowdsec/protect.env
 APPSEC_ACQUIS=/etc/crowdsec/acquis.d/protect-appsec.yaml
 BAOTA_ACQUIS=/etc/crowdsec/acquis.d/protect-baota.yaml
@@ -46,6 +49,7 @@ usage() {
   --reset-exceptions   清除所有放行例外，恢复默认规则
   --unban IP           解封一个被误封的 IP，可以顺便加入白名单
   --uninstall          卸载
+  --version            显示版本号
   -y                   跳过确认
 EOF
 }
@@ -98,6 +102,10 @@ while [ $# -gt 0 ]; do
 	--uninstall) action=uninstall ;;
 	-h | --help)
 		usage
+		exit 0
+		;;
+	--version)
+		say "protect.sh $VERSION"
 		exit 0
 		;;
 	*) die "不认识的参数：$1（用 --help 查看用法）" ;;
@@ -236,7 +244,7 @@ choose_mode() {
 
 show_plan() {
 	say ""
-	say "将要在这台服务器上做以下事情："
+	say "protect.sh $VERSION 将要在这台服务器上做以下事情："
 	say "  系统：$OS_NAME · Web 服务器：$WEB_NAME"
 	if [ "$MODE" = full ]; then
 		say "  防护级别：完整（请求到达网站之前就检测，攻击请求直接返回 403）"
@@ -379,6 +387,7 @@ EOF
 MODE=$MODE
 WEB=$WEB
 STRICT=$strict
+INSTALLED_VERSION=$VERSION
 EOF
 
 	step "检查"
@@ -454,6 +463,7 @@ load_state() {
 
 status() {
 	load_state
+	say "protect.sh $VERSION（安装时的版本：${INSTALLED_VERSION:-未知}）"
 	if [ "$MODE" = full ]; then say "防护级别：完整"; else say "防护级别：基础"; fi
 	check || true
 	say ""

@@ -12,6 +12,8 @@ on:
     # 每周一检查一次，及早发现 CrowdSec 上游的变化把脚本弄坏
     - cron: "0 3 * * 1"
   workflow_dispatch:
+  # 发布工作流先调用这里，全部场景通过才发布
+  workflow_call:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

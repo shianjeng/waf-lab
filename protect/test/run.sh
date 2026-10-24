@@ -60,6 +60,13 @@ install_protect() {
 		bash /root/protect.sh -y "$@" >"$LOGS/$name.install.log" 2>&1
 }
 
+# 模拟 curl ... | sudo bash -s -- -y：脚本从标准输入读进来，而不是从文件运行
+install_protect_piped() {
+	local name=$1
+	docker exec -e SSH_CONNECTION="$ADMIN 51000 10.0.0.2 22" "pt-$name" \
+		bash -c 'cat /root/protect.sh | bash -s -- -y' >"$LOGS/$name.install.log" 2>&1
+}
+
 uninstall_checks() {
 	local name=$1
 	in_box "$name" "bash /root/protect.sh --uninstall -y" >"$LOGS/$name.uninstall.log" 2>&1
@@ -98,10 +105,16 @@ in_firewall() {
 }
 
 full_mode() {
-	local name=$1
-	echo "== $name（应为完整模式）"
+	local name=$1 how=${2:-file}
 	start "$name"
-	expect "安装成功" install_protect "$name"
+	if [ "$how" = piped ]; then
+		echo "== $name（应为完整模式，用 curl | bash 的方式安装）"
+		expect "安装成功" install_protect_piped "$name"
+	else
+		echo "== $name（应为完整模式）"
+		expect "安装成功" install_protect "$name"
+	fi
+	expect "显示了版本号" grep -q "protect.sh [0-9]" "$LOGS/$name.install.log"
 	expect "选择了完整模式" grep -q "防护级别：完整" "$LOGS/$name.install.log"
 	expect "自检：/.env 被拦截" grep -q "被拦截（403）" "$LOGS/$name.install.log"
 	expect "正常页面不受影响（200）" test "$(http_code "$name" /)" = 200
@@ -173,7 +186,7 @@ only=${1:-}
 want() { [ -z "$only" ] || [ "$only" = "$1" ]; }
 
 want debian12 && { build debian12 Dockerfile.debian debian:12 && full_mode debian12; }
-want ubuntu2404 && { build ubuntu2404 Dockerfile.debian ubuntu:24.04 && full_mode ubuntu2404; }
+want ubuntu2404 && { build ubuntu2404 Dockerfile.debian ubuntu:24.04 && full_mode ubuntu2404 piped; }
 want strict && { build debian12 Dockerfile.debian debian:12 && strict_false_positive; }
 want rocky9 && { build rocky9 Dockerfile.rocky && basic_mode rocky9 /var/log/nginx/access.log; }
 want anolis && { build anolis Dockerfile.anolis && basic_mode anolis /var/log/nginx/access.log; }

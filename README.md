@@ -13,16 +13,18 @@ Two tools for protecting websites. Neither one sends attack traffic to any outsi
 
 ## One-click protection: protect.sh
 
-Copy `protect/protect.sh` to your server and run:
+On your server, run:
 
 ```bash
-sudo bash protect.sh
+curl -fsSL https://github.com/shianjeng/waf-lab/releases/latest/download/protect.sh | sudo bash
 ```
+
+To pass options, put them after `bash -s --`, for example `... | sudo bash -s -- --strict`. If you'd rather check the script before running it, see [Checking the download](#checking-the-download).
 
 It first lists what it is going to do and only starts after you confirm. The script's messages are in Chinese; translated, they look like this:
 
 ```
-This will do the following on this server:
+protect.sh 0.1.0 will do the following on this server:
   System: Ubuntu 24.04 LTS · Web server: Nginx 1.24.0
   Protection level: full (requests are checked before they reach the site; attacks get a 403)
 
@@ -33,6 +35,26 @@ This will do the following on this server:
 ```
 
 Protection comes from [CrowdSec](https://www.crowdsec.net). Step 4 finds the IP you are logged in over SSH from and allowlists it, so a few mistyped passwords can't lock you out of your own server.
+
+### Checking the download
+
+Piping a script into `sudo bash` means running it unseen. To check it first:
+
+```bash
+curl -fsSLO https://github.com/shianjeng/waf-lab/releases/latest/download/protect.sh
+curl -fsSLO https://github.com/shianjeng/waf-lab/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS
+less protect.sh
+sudo bash protect.sh
+```
+
+`SHA256SUMS` catches a corrupted or swapped download. It's published next to the script, though, so it can't protect against someone who controls the release itself. For that, every release also carries a GitHub provenance attestation, which proves the file was built by this repository's release workflow. To verify it with the [GitHub CLI](https://cli.github.com):
+
+```bash
+gh attestation verify protect.sh --repo shianjeng/waf-lab
+```
+
+To install a specific version, replace `latest/download` with `download/v0.1.0` in the URLs. `bash protect.sh --version` shows which version you have.
 
 ### Two protection levels
 
@@ -87,6 +109,7 @@ An exception only covers the rules that fired for that block. Other attacks on t
 | `--strict` | At install time, also enable the OWASP CRS rules: more attacks blocked, but more false positives too (see the lab results below) |
 | `--allow-ip IP` | At install time, allowlist an extra IP |
 | `--uninstall` | Remove everything |
+| `--version` | Show the version |
 
 ### Good to know
 
@@ -107,6 +130,17 @@ protect/test/run.sh rocky9     # just one
 The "attacker" in the tests is a few made-up lines written straight into the test server's log file, using IP addresses reserved for documentation. The tests send no attack traffic over the network.
 
 GitHub Actions runs ShellCheck on every push. It runs these scenarios in parallel when something under `protect/` changes, every Monday, or when you start it by hand from the Actions tab.
+
+### Releasing
+
+Change `VERSION` in `protect/protect.sh`, commit, then push a matching tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow runs all the test scenarios first. It only publishes `protect.sh`, `SHA256SUMS` and the provenance attestation if they all pass and the tag matches `VERSION`.
 
 ---
 
@@ -183,7 +217,7 @@ The per-category breakdown is in `reports/index.html`, written by `./waflab run`
 ```
 protect/protect.sh        one-click protection script
 protect/test/             tests for protect.sh on servers simulated in Docker
-.github/workflows/        GitHub Actions: ShellCheck, and the protect.sh tests
+.github/workflows/        GitHub Actions: ShellCheck, the protect.sh tests, and releases
 waflab                    entry point for the comparison lab
 compose.yaml              backend + Coraza + CrowdSec + BunkerWeb
 coraza/ crowdsec/         builds and configs for the two Caddy plugins
@@ -206,16 +240,18 @@ scripts/                  test and report scripts for the lab
 
 ## 一键防护：protect.sh
 
-把 `protect/protect.sh` 传到服务器上，然后运行：
+在服务器上运行：
 
 ```bash
-sudo bash protect.sh
+curl -fsSL https://github.com/shianjeng/waf-lab/releases/latest/download/protect.sh | sudo bash
 ```
+
+要加选项的话，写在 `bash -s --` 后面，比如 `... | sudo bash -s -- --strict`。想先检查脚本再运行，见[校验下载的文件](#校验下载的文件)。
 
 它会先列出要做的事情，你确认之后才会动手：
 
 ```
-将要在这台服务器上做以下事情：
+protect.sh 0.1.0 将要在这台服务器上做以下事情：
   系统：Ubuntu 24.04 LTS · Web 服务器：Nginx 1.24.0
   防护级别：完整（请求到达网站之前就检测，攻击请求直接返回 403）
 
@@ -226,6 +262,26 @@ sudo bash protect.sh
 ```
 
 防护用的是 [CrowdSec](https://www.crowdsec.net)。第 4 步会自动识别你当前 SSH 登录用的 IP 并加入白名单，避免输错几次密码就把自己封在外面。
+
+### 校验下载的文件
+
+把脚本直接交给 `sudo bash`，等于没看内容就运行。想先检查的话：
+
+```bash
+curl -fsSLO https://github.com/shianjeng/waf-lab/releases/latest/download/protect.sh
+curl -fsSLO https://github.com/shianjeng/waf-lab/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS
+less protect.sh
+sudo bash protect.sh
+```
+
+`SHA256SUMS` 能发现下载过程中损坏或被替换的文件。但它和脚本放在同一个地方，如果有人控制了发布本身，它就防不住了。为此，每个版本还附带 GitHub 的来源证明，证明这个文件是由本仓库的发布工作流构建的。用 [GitHub 命令行工具](https://cli.github.com) 验证：
+
+```bash
+gh attestation verify protect.sh --repo shianjeng/waf-lab
+```
+
+要安装指定版本，把网址里的 `latest/download` 换成 `download/v0.1.0`。`bash protect.sh --version` 可以查看当前版本。
 
 ### 两种防护级别
 
@@ -278,6 +334,7 @@ sudo bash protect.sh --blocks
 | `--strict` | 安装时额外启用 OWASP CRS 规则：拦得更多，误报也更多（见下面的实验室结果） |
 | `--allow-ip IP` | 安装时额外把一个 IP 加入白名单 |
 | `--uninstall` | 卸载 |
+| `--version` | 显示版本号 |
 
 ### 需要知道的几件事
 
@@ -298,6 +355,17 @@ protect/test/run.sh rocky9     # 只测一种
 测试里的"攻击者"是直接写进测试机日志文件的几行模拟记录，用的是文档专用的 IP 地址段，不会发出任何网络请求。
 
 GitHub Actions 会在每次推送时用 ShellCheck 检查脚本；`protect/` 有改动、每周一，或者在 Actions 页面手动触发时，会并行跑完这些测试场景。
+
+### 发布新版本
+
+修改 `protect/protect.sh` 里的 `VERSION`，提交，然后推送对应的标签：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+发布工作流会先跑完所有测试场景。只有全部通过、并且标签和 `VERSION` 一致，才会发布 `protect.sh`、`SHA256SUMS` 和来源证明。
 
 ---
 
@@ -374,7 +442,7 @@ Apple Silicon，Docker Engine 29.8，GoTestWAF 0.5.8。雷池需要手动添加�
 ```
 protect/protect.sh        一键防护脚本
 protect/test/             在 Docker 里模拟服务器测试 protect.sh
-.github/workflows/        GitHub Actions：ShellCheck 检查和 protect.sh 测试
+.github/workflows/        GitHub Actions：ShellCheck 检查、protect.sh 测试和发布
 waflab                    对比实验室的入口
 compose.yaml              后端 + Coraza + CrowdSec + BunkerWeb
 coraza/ crowdsec/         两个 Caddy 插件的构建和配置
