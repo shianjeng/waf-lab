@@ -148,10 +148,21 @@ admin_ip() {
 
 detect_os() {
 	[ -r /etc/os-release ] || die "无法识别操作系统（没有 /etc/os-release）"
+	# 在子 shell 里读 os-release，只取需要的几个值。直接 source 会覆盖脚本自己的变量：
+	# os-release 里也有 VERSION（比如 "12 (bookworm)"）
+	local fields
 	# shellcheck disable=SC1091
-	. /etc/os-release
-	OS_NAME="${PRETTY_NAME:-$ID}"
-	case " ${ID:-} ${ID_LIKE:-} " in
+	fields=$(
+		. /etc/os-release
+		printf '%s\n' "${ID:-}" "${ID_LIKE:-}" "${VERSION_ID:-}" "${PRETTY_NAME:-${ID:-}}"
+	)
+	{
+		read -r OS_ID
+		read -r OS_LIKE
+		read -r OS_VERSION_ID
+		read -r OS_NAME
+	} <<<"$fields"
+	case " $OS_ID $OS_LIKE " in
 	*" debian "* | *" ubuntu "*) PKG=apt ;;
 	*" rhel "* | *" centos "* | *" fedora "* | *" rocky "* | *" almalinux "* | *" alinux "* | *" anolis "* | *" opencloudos "*)
 		if command -v dnf >/dev/null 2>&1; then PKG=dnf; else PKG=yum; fi
@@ -179,12 +190,27 @@ detect_web() {
 	fi
 }
 
+# 下载类的步骤遇到网络抖动就重试，最多 3 次。国内服务器访问 CrowdSec 的国外源时很常见
+retry() {
+	local n
+	for n in 1 2 3; do
+		"$@" && return 0
+		if [ "$n" -lt 3 ]; then
+			warn "网络操作失败，$((n * 5)) 秒后重试（第 $n 次）：$*"
+			sleep $((n * 5))
+		fi
+	done
+	return 1
+}
+
 pkg_install() {
 	case "$PKG" in
-	apt) DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null ;;
-	*) "$PKG" install -y -q "$@" >/dev/null ;;
+	apt) retry env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null ;;
+	*) retry "$PKG" install -y -q "$@" >/dev/null ;;
 	esac
 }
+
+hub_install() { retry cscli collections install "$@" >/dev/null; }
 
 pkg_remove() {
 	case "$PKG" in
@@ -193,25 +219,59 @@ pkg_remove() {
 	esac
 }
 
+CROWDSEC_REPO_FILES=(
+	/etc/apt/sources.list.d/crowdsec_crowdsec.list
+	/etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg
+	/etc/yum.repos.d/crowdsec_crowdsec.repo
+)
+
+repo_present() {
+	if [ "$PKG" = apt ]; then
+		[ -f /etc/apt/sources.list.d/crowdsec_crowdsec.list ]
+	else
+		[ -f /etc/yum.repos.d/crowdsec_crowdsec.repo ]
+	fi
+}
+
+# 刷新 CrowdSec 软件源。apt-get update 只要有任何一个软件源出错就会失败，所以只看
+# 和 CrowdSec 软件源有关的错误，别的软件源的问题不算在它头上
+repo_works() {
+	if [ "$PKG" = apt ]; then
+		local out errors
+		out=$(apt-get update 2>&1 || true)
+		errors=$(printf '%s\n' "$out" | grep -E '^(E|W):' | grep -c 'packagecloud.io/crowdsec' || true)
+		[ "$errors" -eq 0 ]
+	else
+		"$PKG" -q makecache --disablerepo='*' --enablerepo='crowdsec_crowdsec' >/dev/null 2>&1
+	fi
+}
+
 add_repo() {
 	command -v curl >/dev/null 2>&1 || pkg_install curl
-	if [ "$PKG" = apt ] && [ -f /etc/apt/sources.list.d/crowdsec_crowdsec.list ]; then return 0; fi
-	if [ "$PKG" != apt ] && [ -f /etc/yum.repos.d/crowdsec_crowdsec.repo ]; then return 0; fi
 	# 官方安装脚本不认识阿里云 Linux、龙蜥、OpenCloudOS 这些兼容 RHEL 的系统，会直接拒绝。
 	# CrowdSec 的 RPM 软件源对 RHEL 系是通用的，所以让它按 RHEL 处理
-	local override=() out version=${VERSION_ID:-9}
+	local override=() out="" version=${OS_VERSION_ID:-9} n
 	if [ "$PKG" != apt ]; then
-		case "${ID:-}" in
+		case "$OS_ID" in
 		centos | rhel | fedora | amzn | cloudlinux | almalinux | rocky | ol) ;;
 		*) override=(os=rhel "dist=${version%%.*}") ;;
 		esac
 	fi
-	if ! out=$(curl -fsSL https://install.crowdsec.net | env ${override[@]+"${override[@]}"} sh 2>&1); then
-		printf '%s\n' "$out" | tail -n 8 >&2
-		die "添加 CrowdSec 软件源失败，原因见上面的输出"
-	fi
-	if [ "$PKG" = apt ]; then apt-get update -qq >/dev/null; fi
-	return 0
+	for n in 1 2 3; do
+		if ! repo_present; then
+			out=$(curl -fsSL https://install.crowdsec.net | env ${override[@]+"${override[@]}"} sh 2>&1) || true
+		fi
+		repo_works && return 0
+		# 官方脚本下载签名密钥失败时不会报错，会留下一个没有密钥、用不了的软件源，
+		# 而且软件源文件已经在了，下次运行也不会重新添加。删掉重来
+		rm -f "${CROWDSEC_REPO_FILES[@]}"
+		if [ "$n" -lt 3 ]; then
+			warn "CrowdSec 软件源没有配置成功，$((n * 5)) 秒后重试（第 $n 次）"
+			sleep $((n * 5))
+		fi
+	done
+	[ -n "$out" ] && printf '%s\n' "$out" | tail -n 8 >&2
+	die "添加 CrowdSec 软件源失败。多半是网络问题，稍后重新运行即可"
 }
 
 # 完整模式需要 Debian/Ubuntu 软件源里的 Nginx Lua 模块。如果装它会替换或删除
@@ -280,9 +340,9 @@ show_plan() {
 
 setup_appsec() {
 	local configs="  - crowdsecurity/appsec-default"
-	cscli collections install crowdsecurity/appsec-virtual-patching crowdsecurity/appsec-generic-rules >/dev/null
+	hub_install crowdsecurity/appsec-virtual-patching crowdsecurity/appsec-generic-rules
 	if [ "$strict" -eq 1 ]; then
-		cscli collections install crowdsecurity/appsec-crs-inband >/dev/null
+		hub_install crowdsecurity/appsec-crs-inband
 		configs="$configs
   - crowdsecurity/crs-inband"
 	fi
@@ -335,7 +395,7 @@ install() {
 	step "安装 CrowdSec"
 	pkg_install crowdsec
 	# 安装时会自动识别 Nginx、SSH 并启用对应规则；这里再装一遍确保齐全
-	cscli collections install crowdsecurity/nginx crowdsecurity/base-http-scenarios crowdsecurity/http-cve >/dev/null
+	hub_install crowdsecurity/nginx crowdsecurity/base-http-scenarios crowdsecurity/http-cve
 	if [ "$WEB" = baota ]; then
 		cat >"$BAOTA_ACQUIS" <<'EOF'
 # 由 protect.sh 生成：宝塔把各站点的日志放在 /www/wwwlogs
@@ -383,12 +443,8 @@ EOF
 		systemctl reload nginx
 	fi
 
-	cat >"$STATE" <<EOF
-MODE=$MODE
-WEB=$WEB
-STRICT=$strict
-INSTALLED_VERSION=$VERSION
-EOF
+	# 这个文件之后会被 source，所以每个值都要转义，免得空格、括号之类的字符变成语法错误
+	printf 'MODE=%q\nWEB=%q\nSTRICT=%q\nINSTALLED_VERSION=%q\n' "$MODE" "$WEB" "$strict" "$VERSION" >"$STATE"
 
 	step "检查"
 	check || warn "有组件没有正常运行，按上面的提示排查"

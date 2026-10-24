@@ -11,6 +11,7 @@ cd "$(dirname "$0")"
 
 ADMIN=198.51.100.7
 ATTACKER=203.0.113.77
+VERSION=$(sed -nE 's/^VERSION=([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' ../protect.sh)
 # CI 里用 LOGS_DIR 指定日志目录，失败时把日志上传下来
 LOGS=${LOGS_DIR:-$(mktemp -d)}
 mkdir -p "$LOGS"
@@ -104,9 +105,21 @@ in_firewall() {
 	return 1
 }
 
+# 模拟官方安装脚本下载签名密钥失败后留下的状态：软件源文件在，密钥文件是空的。
+# protect.sh 应该发现软件源用不了，删掉重新添加
+break_repo() {
+	in_box "$1" "mkdir -p /etc/apt/keyrings
+		echo 'deb [signed-by=/etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg] https://packagecloud.io/crowdsec/crowdsec/any/ any main' \
+			>/etc/apt/sources.list.d/crowdsec_crowdsec.list
+		: >/etc/apt/keyrings/crowdsec_crowdsec-archive-keyring.gpg"
+}
+
 full_mode() {
-	local name=$1 how=${2:-file}
+	local name=$1 how=${2:-file} prep=${3:-}
 	start "$name"
+	if [ "$prep" = broken-repo ]; then
+		break_repo "$name"
+	fi
 	if [ "$how" = piped ]; then
 		echo "== $name（应为完整模式，用 curl | bash 的方式安装）"
 		expect "安装成功" install_protect_piped "$name"
@@ -114,7 +127,11 @@ full_mode() {
 		echo "== $name（应为完整模式）"
 		expect "安装成功" install_protect "$name"
 	fi
-	expect "显示了版本号" grep -q "protect.sh [0-9]" "$LOGS/$name.install.log"
+	expect "安装计划显示了版本号 $VERSION" grep -q "protect.sh $VERSION 将要" "$LOGS/$name.install.log"
+	if [ "$prep" = broken-repo ]; then
+		expect "发现并修复了损坏的软件源" grep -q "CrowdSec 软件源没有配置成功" "$LOGS/$name.install.log"
+	fi
+	status_works "$name"
 	expect "选择了完整模式" grep -q "防护级别：完整" "$LOGS/$name.install.log"
 	expect "自检：/.env 被拦截" grep -q "被拦截（403）" "$LOGS/$name.install.log"
 	expect "正常页面不受影响（200）" test "$(http_code "$name" /)" = 200
@@ -124,6 +141,13 @@ full_mode() {
 	uninstall_checks "$name"
 }
 
+# --status 会读回安装时保存的状态文件，能发现状态文件写坏之类的问题
+status_works() {
+	local name=$1
+	expect "--status 正常，版本一致" in_box "$name" \
+		"bash /root/protect.sh --status | grep -qF 'protect.sh $VERSION（安装时的版本：$VERSION）'"
+}
+
 # 攻击者可以在 URL 路径里编码换行和制表符（%0A、%09），想在管理员放行时顺带写进一条
 # "全站关闭 .env 规则"的例外。--allow-block 必须拒绝，例外列表保持为空
 crafted_path_rejected() {
@@ -131,7 +155,8 @@ crafted_path_rejected() {
 	in_box "$name" "curl -s -o /dev/null 'http://127.0.0.1/a%0A*%09crowdsecurity%2Fvpatch-env-access%0A/.env'"
 	sleep 2
 	id=$(in_box "$name" "cscli alerts list -o raw | awk -F, 'NR == 2 { print \$1 }'")
-	expect "构造的路径不能放行" in_box "$name" "! bash /root/protect.sh --allow-block $id"
+	# 要看到具体的拒绝原因，而不只是命令失败：别的错误也会让它失败
+	expect "构造的路径被识别并拒绝" in_box "$name" "bash /root/protect.sh --allow-block $id 2>&1 | grep -q 控制字符"
 	expect "例外列表没有被写入" in_box "$name" "! grep -q . /etc/crowdsec/protect-exceptions.list"
 	expect "其他路径的 .env 仍然被拦" test "$(http_code "$name" /b/.env)" = 403
 }
@@ -143,6 +168,7 @@ strict_false_positive() {
 	echo "== debian12 严格模式 + 误报处理"
 	start "$name" debian12
 	expect "安装成功" install_protect "$name" --strict
+	status_works "$name"
 	expect "普通句子被 CRS 误拦（403）" test "$(http_code "$name" "$benign")" = 403
 	sleep 2
 	id=$(in_box "$name" "cscli alerts list -o raw | awk -F, 'NR == 2 { print \$1 }'")
@@ -173,6 +199,7 @@ basic_mode() {
 	expect "安装成功" install_protect "$name"
 	expect "选择了基础模式" grep -q "防护级别：基础" "$LOGS/$name.install.log"
 	expect "检查结果显示正在监控日志" grep -q "\[正常\] 正在监控" "$LOGS/$name.install.log"
+	status_works "$name"
 	expect "正常页面不受影响（200）" test "$(http_code "$name" /)" = 200
 	simulate_scan "$name" "$log"
 	expect "防火墙组件在运行" in_box "$name" "systemctl is-active --quiet crowdsec-firewall-bouncer"
@@ -185,7 +212,7 @@ basic_mode() {
 only=${1:-}
 want() { [ -z "$only" ] || [ "$only" = "$1" ]; }
 
-want debian12 && { build debian12 Dockerfile.debian debian:12 && full_mode debian12; }
+want debian12 && { build debian12 Dockerfile.debian debian:12 && full_mode debian12 file broken-repo; }
 want ubuntu2404 && { build ubuntu2404 Dockerfile.debian ubuntu:24.04 && full_mode ubuntu2404 piped; }
 want strict && { build debian12 Dockerfile.debian debian:12 && strict_false_positive; }
 want rocky9 && { build rocky9 Dockerfile.rocky && basic_mode rocky9 /var/log/nginx/access.log; }
