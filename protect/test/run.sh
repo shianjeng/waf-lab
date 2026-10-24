@@ -11,7 +11,9 @@ cd "$(dirname "$0")"
 
 ADMIN=198.51.100.7
 ATTACKER=203.0.113.77
-LOGS=$(mktemp -d)
+# CI 里用 LOGS_DIR 指定日志目录，失败时把日志上传下来
+LOGS=${LOGS_DIR:-$(mktemp -d)}
+mkdir -p "$LOGS"
 failures=0
 
 build() {
@@ -24,11 +26,11 @@ build() {
 }
 
 start() {
-	local name=$1 image=${2:-$1} i state
+	local name=$1 image=${2:-$1} state
 	docker rm -f "pt-$name" >/dev/null 2>&1 || true
 	docker run -d --name "pt-$name" --privileged --cgroupns=host \
 		-v /sys/fs/cgroup:/sys/fs/cgroup:rw "waf-lab/test-$image" >/dev/null
-	for i in $(seq 1 30); do
+	for _ in $(seq 1 30); do
 		state=$(docker exec "pt-$name" systemctl is-system-running 2>/dev/null || true)
 		case "$state" in running | degraded) break ;; esac
 		sleep 1
@@ -77,8 +79,8 @@ simulate_scan() {
 }
 
 banned() {
-	local name=$1 i
-	for i in $(seq 1 30); do
+	local name=$1
+	for _ in $(seq 1 30); do
 		in_box "$name" "cscli decisions list -o raw | grep -q $ATTACKER" && return 0
 		sleep 1
 	done
@@ -87,8 +89,8 @@ banned() {
 
 # 防火墙组件每 10 秒向 CrowdSec 拉一次封禁列表，所以要多等一会儿
 in_firewall() {
-	local name=$1 i
-	for i in $(seq 1 30); do
+	local name=$1
+	for _ in $(seq 1 30); do
 		in_box "$name" "nft list ruleset | grep -q $ATTACKER" && return 0
 		sleep 1
 	done
@@ -137,6 +139,14 @@ strict_false_positive() {
 	expect "放行后 /search 不再拦这句话" test "$(http_code "$name" "$benign")" != 403
 	expect "其他路径仍然拦这句话" test "$(http_code "$name" "/other?q=zsh%20is%20the%20best%21")" = 403
 	expect "/search 上的 XSS 仍然被拦" test "$(http_code "$name" "/search?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E")" = 403
+	expect "--exceptions 列出 /search" in_box "$name" "bash /root/protect.sh --exceptions | grep -q '\[1\] /search'"
+	expect "--remove-exception 撤销成功" in_box "$name" "bash /root/protect.sh --remove-exception 1 -y"
+	sleep 6
+	expect "撤销后恢复拦截" test "$(http_code "$name" "$benign")" = 403
+	expect "撤销后例外列表为空" in_box "$name" "bash /root/protect.sh --exceptions | grep -q '没有放行例外'"
+	sleep 2
+	id=$(in_box "$name" "cscli alerts list -o raw | awk -F, 'NR == 2 { print \$1 }'")
+	in_box "$name" "bash /root/protect.sh --allow-block $id" >/dev/null 2>&1
 	expect "--reset-exceptions 成功" in_box "$name" "bash /root/protect.sh --reset-exceptions -y"
 	sleep 6
 	expect "清除例外后恢复拦截" test "$(http_code "$name" "$benign")" = 403

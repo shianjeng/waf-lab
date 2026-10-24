@@ -70,6 +70,7 @@ This block matched 1 rule. Allow it:
   2. Site-wide
 Choose [1/2]: 1
 Allowed 1 rule on /search (1 new exception). Other paths are still checked.
+To undo it, run sudo bash protect.sh --exceptions and remove it by number.
 ```
 
 An exception only covers the rules that fired for that block. Other attacks on the same path, such as XSS or command injection, are still blocked.
@@ -78,6 +79,8 @@ An exception only covers the rules that fired for that block. Other attacks on t
 |---|---|
 | `--blocks` | List recent blocks and allow one by number |
 | `--allow-block ID` | Allow a block without prompts; add `--site-wide` to allow it everywhere |
+| `--exceptions` | List the exceptions, grouped by path |
+| `--remove-exception N` | Undo the exception on one path, so those requests are blocked again |
 | `--unban IP` | Lift a ban on an IP, and optionally allowlist it |
 | `--reset-exceptions` | Remove all exceptions |
 | `--status` | Show whether protection is running and the latest attacks |
@@ -102,6 +105,8 @@ protect/test/run.sh rocky9     # just one
 ```
 
 The "attacker" in the tests is a few made-up lines written straight into the test server's log file, using IP addresses reserved for documentation. The tests send no attack traffic over the network.
+
+GitHub Actions runs ShellCheck on every push. It runs these scenarios in parallel when something under `protect/` changes, every Monday, or when you start it by hand from the Actions tab.
 
 ---
 
@@ -178,6 +183,7 @@ The per-category breakdown is in `reports/index.html`, written by `./waflab run`
 ```
 protect/protect.sh        one-click protection script
 protect/test/             tests for protect.sh on servers simulated in Docker
+.github/workflows/        GitHub Actions: ShellCheck, and the protect.sh tests
 waflab                    entry point for the comparison lab
 compose.yaml              backend + Coraza + CrowdSec + BunkerWeb
 coraza/ crowdsec/         builds and configs for the two Caddy plugins
@@ -255,6 +261,7 @@ sudo bash protect.sh --blocks
   2. 全站放行
 请选择 [1/2]：1
 已在 /search 放行这 1 条规则（新增 1 条例外），其他路径照常检测。
+反悔了可以用 sudo bash protect.sh --exceptions 查看，再按编号删除。
 ```
 
 放行只针对这次拦截命中的那几条规则。同一个路径上的其他攻击（比如 XSS、命令注入）仍然会被拦。
@@ -263,6 +270,8 @@ sudo bash protect.sh --blocks
 |---|---|
 | `--blocks` | 查看最近被拦截的请求，输入编号放行 |
 | `--allow-block 编号` | 不用交互直接放行，加 `--site-wide` 全站放行 |
+| `--exceptions` | 按路径列出已放行的例外 |
+| `--remove-exception 编号` | 撤销某个路径上的放行，这类请求会重新被拦截 |
 | `--unban IP` | 解封一个被误封的 IP，可以顺便加入白名单 |
 | `--reset-exceptions` | 清除所有放行例外 |
 | `--status` | 查看防护状态和最近的攻击 |
@@ -287,6 +296,8 @@ protect/test/run.sh rocky9     # 只测一种
 ```
 
 测试里的"攻击者"是直接写进测试机日志文件的几行模拟记录，用的是文档专用的 IP 地址段，不会发出任何网络请求。
+
+GitHub Actions 会在每次推送时用 ShellCheck 检查脚本；`protect/` 有改动、每周一，或者在 Actions 页面手动触发时，会并行跑完这些测试场景。
 
 ---
 
@@ -363,6 +374,7 @@ Apple Silicon，Docker Engine 29.8，GoTestWAF 0.5.8。雷池需要手动添加�
 ```
 protect/protect.sh        一键防护脚本
 protect/test/             在 Docker 里模拟服务器测试 protect.sh
+.github/workflows/        GitHub Actions：ShellCheck 检查和 protect.sh 测试
 waflab                    对比实验室的入口
 compose.yaml              后端 + Coraza + CrowdSec + BunkerWeb
 coraza/ crowdsec/         两个 Caddy 插件的构建和配置

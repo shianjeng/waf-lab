@@ -1,0 +1,45 @@
+name: protect.sh
+
+# 在 Docker 模拟的服务器上跑 protect.sh 的完整测试，每个场景一个并行任务，各约 5 分钟。
+# 只在 protect/ 有改动、每周定时或手动触发时运行，免得每次推送都消耗 Actions 分钟数
+on:
+  push:
+    branches: [main]
+    paths: ["protect/**", ".github/workflows/protect.yml"]
+  pull_request:
+    paths: ["protect/**", ".github/workflows/protect.yml"]
+  schedule:
+    # 每周一检查一次，及早发现 CrowdSec 上游的变化把脚本弄坏
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.scenario }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [debian12, ubuntu2404, strict, rocky9, anolis, baota]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run scenario
+        env:
+          LOGS_DIR: ${{ runner.temp }}/protect-logs
+        run: protect/test/run.sh "${{ matrix.scenario }}"
+
+      - name: Upload install logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: protect-logs-${{ matrix.scenario }}
+          path: ${{ runner.temp }}/protect-logs

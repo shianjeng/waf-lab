@@ -6,6 +6,7 @@
 #   sudo bash protect.sh --allow-ip IP 额外把一个 IP 加入白名单（可以重复）
 #   sudo bash protect.sh --status      查看防护状态
 #   sudo bash protect.sh --blocks      查看最近拦截的请求，把误拦的放行
+#   sudo bash protect.sh --exceptions  查看已放行的例外，可以按编号删除
 #   sudo bash protect.sh --unban IP    解封一个被误封的 IP
 #   sudo bash protect.sh --uninstall   卸载
 #   加 -y 跳过确认
@@ -39,8 +40,11 @@ usage() {
   --status             查看防护状态和最近拦截的攻击
   --blocks             查看最近被拦截的请求，输入编号把误拦的放行
   --allow-block 编号   不用交互，直接放行某次拦截（只在那个路径；加 --site-wide 全站放行）
-  --unban IP           解封一个被误封的 IP，可以顺便加入白名单
+  --exceptions         查看已放行的例外
+  --remove-exception 编号
+                       撤销某个路径上的放行，那类请求会重新被拦截
   --reset-exceptions   清除所有放行例外，恢复默认规则
+  --unban IP           解封一个被误封的 IP，可以顺便加入白名单
   --uninstall          卸载
   -y                   跳过确认
 EOF
@@ -58,6 +62,7 @@ site_wide=0
 extra_ips=()
 unban_ip=""
 block_id=""
+exception_id=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 	-y | --yes) assume_yes=1 ;;
@@ -80,6 +85,13 @@ while [ $# -gt 0 ]; do
 		[ $# -ge 2 ] || die "--unban 后面要跟一个 IP"
 		action=unban
 		unban_ip=$2
+		shift
+		;;
+	--exceptions) action=exceptions ;;
+	--remove-exception)
+		[ $# -ge 2 ] || die "--remove-exception 后面要跟例外编号（用 --exceptions 查看）"
+		action=remove_exception
+		exception_id=$2
 		shift
 		;;
 	--reset-exceptions) action=reset_exceptions ;;
@@ -403,9 +415,9 @@ check() {
 		# 只向本机发探测 .env 文件的请求，确认防护已经生效。重新加载后检测组件要
 		# 过几秒才就绪，所以最多等 20 秒。先看一眼首页，默认站点如果本来就返回 403，
 		# 就没法用它来确认
-		local base code="" i
+		local base code=""
 		base=$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1/ || true)
-		for i in $(seq 1 20); do
+		for _ in $(seq 1 20); do
 			code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1/.env || true)
 			[ "$code" = 403 ] && break
 			sleep 1
@@ -504,6 +516,13 @@ rule_call() {
 	esac
 }
 
+# 某个路径上放行的规则。路径通过环境变量交给 awk，因为 awk -v 会把路径里的反斜杠
+# 当成转义符，导致匹配不上
+rules_for_path() { P="$1" awk -F'\t' '$1 == ENVIRON["P"] { print $2 }' "$EXCEPTIONS_LIST"; }
+
+# 放行过的路径，按第一次放行的顺序，* 表示全站
+exception_paths() { awk -F'\t' 'NF && !seen[$1]++ { print $1 }' "$EXCEPTIONS_LIST"; }
+
 write_exceptions() {
 	mkdir -p "$(dirname "$EXCEPTIONS_YAML")"
 	touch "$EXCEPTIONS_LIST"
@@ -524,7 +543,7 @@ write_exceptions() {
 			grep -v "^\*$tab" "$EXCEPTIONS_LIST" | cut -f1 | sort -u | while IFS= read -r path; do
 				echo "  - filter: $(yaml_quote "req.URL.Path == $(expr_string "$path")")"
 				echo "    apply:"
-				awk -F'\t' -v p="$path" '$1 == p { print $2 }' "$EXCEPTIONS_LIST" | while IFS= read -r name; do
+				rules_for_path "$path" | while IFS= read -r name; do
 					echo "      - $(yaml_quote "$(rule_call "$name")")"
 				done
 			done
@@ -630,7 +649,57 @@ allow_block() {
 	else
 		say "已在 $path 放行这 $count 条规则（新增 $added 条例外），其他路径照常检测。"
 	fi
-	say "反悔了可以用 sudo bash protect.sh --reset-exceptions 清除所有例外。"
+	say "反悔了可以用 sudo bash protect.sh --exceptions 查看，再按编号删除。"
+}
+
+# 例外里的规则名换成人看得懂的说法
+rule_label() {
+	case "$1" in
+	native_rule:*) printf 'OWASP CRS 规则 %s' "${1#native_rule:}" ;;
+	*) printf '%s' "$1" ;;
+	esac
+}
+
+path_label() { if [ "$1" = '*' ]; then printf '全站'; else clean "$1"; fi; }
+
+# 按路径分组列出。一次放行通常涉及好几条规则，用户要撤销的是"这个路径上的放行"，
+# 只删其中一条规则往往不会让拦截恢复
+exceptions() {
+	load_state
+	[ "$MODE" = full ] || die "基础模式没有放行例外"
+	touch "$EXCEPTIONS_LIST"
+	if ! grep -q . "$EXCEPTIONS_LIST"; then
+		say "没有放行例外。"
+		return
+	fi
+	say "放行例外："
+	local n=0 path rules
+	while IFS= read -r path; do
+		n=$((n + 1))
+		rules=$(rules_for_path "$path" | while IFS= read -r r; do rule_label "$r"; echo; done | join_lines "、")
+		printf '  [%d] %s：%s\n' "$n" "$(path_label "$path")" "$rules"
+	done < <(exception_paths)
+	say ""
+	say "撤销某个路径上的放行：sudo bash protect.sh --remove-exception <编号>"
+}
+
+remove_exception() {
+	local n=$1 total path count
+	load_state
+	[ "$MODE" = full ] || die "基础模式没有放行例外"
+	[[ "$n" =~ ^[0-9]+$ ]] || die "编号要是数字（用 --exceptions 查看）"
+	touch "$EXCEPTIONS_LIST"
+	total=$(exception_paths | grep -c . || true)
+	if [ "$n" -lt 1 ] || [ "$n" -gt "${total:-0}" ]; then
+		die "没有第 $n 个放行，现在一共 ${total:-0} 个（用 --exceptions 查看）"
+	fi
+	path=$(exception_paths | sed -n "${n}p")
+	count=$(rules_for_path "$path" | grep -c .)
+	confirm "撤销 $(path_label "$path") 上的放行（$count 条规则）？之后这类请求会重新被拦截" || die "已取消"
+	P="$path" awk -F'\t' '$1 != ENVIRON["P"]' "$EXCEPTIONS_LIST" >"$EXCEPTIONS_LIST.tmp"
+	mv "$EXCEPTIONS_LIST.tmp" "$EXCEPTIONS_LIST"
+	apply_exceptions
+	say "已撤销 $(path_label "$path") 上的放行。"
 }
 
 unban() {
@@ -679,6 +748,8 @@ allow_block)
 	allow_block "$block_id"
 	;;
 unban) unban "$unban_ip" ;;
+exceptions) exceptions ;;
+remove_exception) remove_exception "$exception_id" ;;
 reset_exceptions) reset_exceptions ;;
 uninstall) uninstall ;;
 esac

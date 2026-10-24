@@ -1,0 +1,25 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: ShellCheck
+        run: |
+          command -v shellcheck >/dev/null || sudo apt-get install -y shellcheck
+          shellcheck --version | head -2
+          shellcheck -S warning waflab protect/protect.sh protect/test/run.sh scripts/*.sh
+
+      - name: Python syntax
+        run: python3 -m py_compile scripts/*.py
