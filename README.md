@@ -19,12 +19,12 @@ On your server, run:
 curl -fsSL https://github.com/shianjeng/waf-lab/releases/latest/download/protect.sh | sudo bash
 ```
 
-To pass options, put them after `bash -s --`, for example `... | sudo bash -s -- --strict`. If you'd rather check the script before running it, see [Checking the download](#checking-the-download).
+To pass options, put them after `bash -s --`, for example `... | sudo bash -s -- --strict`. If you'd rather check the script before running it, see [Checking the download](#checking-the-download). If your server can't reach GitHub, see [Installing without GitHub access](#installing-without-github-access).
 
 It first lists what it is going to do and only starts after you confirm. The script's messages are in Chinese; translated, they look like this:
 
 ```
-protect.sh 0.1.0 will do the following on this server:
+protect 0.2.0 will do the following on this server:
   System: Ubuntu 24.04 LTS · Web server: Nginx 1.24.0
   Protection level: full (requests are checked before they reach the site; attacks get a 403)
 
@@ -35,6 +35,24 @@ protect.sh 0.1.0 will do the following on this server:
 ```
 
 Protection comes from [CrowdSec](https://www.crowdsec.net). Step 4 finds the IP you are logged in over SSH from and allowlists it, so a few mistyped passwords can't lock you out of your own server.
+
+### After installing: `sudo protect`
+
+The install also adds a `protect` command. Run `sudo protect` any time to open a menu, so there are no options to remember. Translated:
+
+```
+protect 0.2.0 · Protection level: full
+
+  1. Show protection status
+  2. A legitimate user was blocked: review and allow
+  3. Review or undo allowed exceptions
+  4. Unban an IP
+  5. Check for updates
+  6. Uninstall
+  0. Exit
+```
+
+Every menu item also has an [option](#options) for scripts.
 
 ### Checking the download
 
@@ -54,7 +72,13 @@ sudo bash protect.sh
 gh attestation verify protect.sh --repo shianjeng/waf-lab
 ```
 
-To install a specific version, replace `latest/download` with `download/v0.1.0` in the URLs. `bash protect.sh --version` shows which version you have.
+To install a specific version, replace `latest/download` with `download/v0.2.0` in the URLs. `bash protect.sh --version` shows which version you have.
+
+### Installing without GitHub access
+
+If your server can't reach GitHub, or it's very slow (common in mainland China), download `protect.sh` from the [latest release](https://github.com/shianjeng/waf-lab/releases/latest) on your own computer. Upload it to the server with `scp`, or BaoTa's file manager, then run `sudo bash protect.sh`. The `protect` command is installed from the uploaded file.
+
+The server still needs to reach CrowdSec's package repository to install CrowdSec, and `--update` needs GitHub.
 
 ### Two protection levels
 
@@ -70,8 +94,10 @@ Both levels also protect SSH against brute-force attacks.
 
 ### When a legitimate user gets blocked
 
+Choose 2 in the menu, or run:
+
 ```bash
-sudo bash protect.sh --blocks
+sudo protect --blocks
 ```
 
 Translated output:
@@ -92,10 +118,14 @@ This block matched 1 rule. Allow it:
   2. Site-wide
 Choose [1/2]: 1
 Allowed 1 rule on /search (1 new exception). Other paths are still checked.
-To undo it, run sudo bash protect.sh --exceptions and remove it by number.
+To undo it, run sudo protect --exceptions and remove it by number.
 ```
 
 An exception only covers the rules that fired for that block. Other attacks on the same path, such as XSS or command injection, are still blocked.
+
+### Options
+
+Run them as `sudo protect <option>`. With no option, `sudo protect` opens the menu.
 
 | Option | What it does |
 |---|---|
@@ -106,14 +136,23 @@ An exception only covers the rules that fired for that block. Other attacks on t
 | `--unban IP` | Lift a ban on an IP, and optionally allowlist it |
 | `--reset-exceptions` | Remove all exceptions |
 | `--status` | Show whether protection is running and the latest attacks |
-| `--strict` | At install time, also enable the OWASP CRS rules: more attacks blocked, but more false positives too (see the lab results below) |
-| `--allow-ip IP` | At install time, allowlist an extra IP |
-| `--uninstall` | Remove everything |
+| `--update` | Update to the latest version, keeping your settings and exceptions |
+| `--reinstall` | Run the install again with your current settings |
+| `--strict` | Also enable the OWASP CRS rules: more attacks blocked, but more false positives too (see the lab results below) |
+| `--no-strict` | Turn strict mode off again |
+| `--allow-ip IP` | Allowlist an extra IP |
+| `--uninstall` | Remove everything, including the `protect` command |
 | `--version` | Show the version |
+
+### Updates
+
+- **Rules update every day on their own.** CrowdSec's own timer (`crowdsec-hubupdate.timer`) fetches new virtual patches and rules daily. protect makes sure it's switched on, and `--status` shows when it last ran.
+- **protect itself updates with `sudo protect --update`**, or 5 in the menu. It downloads the latest release and checks it against `SHA256SUMS` before replacing the command. If the check fails, nothing changes. Your settings, such as strict mode, and your exceptions are kept. The menu and `--status` tell you when a new version is out.
+- **Upgrading from 0.1.0**, which didn't install the `protect` command: run the install command again. It opens the menu and adds the command.
 
 ### Good to know
 
-- **It only protects.** The only requests it sends to your site are two to `127.0.0.1` at the end of the install, for the home page and for `/.env`, to confirm that blocking works.
+- **It only protects.** The only requests it sends to your site are two to `127.0.0.1` at the end of the install, for the home page and for `/.env`, to confirm that blocking works. The menu and `--status` also fetch a few-byte `VERSION` file from GitHub to see whether a new version is out.
 - **It runs CrowdSec's official installer as root.** Step 1 downloads <https://install.crowdsec.net> and runs it to add the package repository, which is the installation method CrowdSec documents. As with any script you run with sudo, read `protect.sh` before running it.
 - **CrowdSec shares data with its community by default.** It sends the IPs and attack types it detects to the CrowdSec community and downloads the community blocklist in return. To opt out, see the [CrowdSec documentation](https://docs.crowdsec.net) on disabling the Central API.
 - **Servers in mainland China** download from CrowdSec's overseas package repository, which can be slow.
@@ -123,7 +162,7 @@ An exception only covers the rules that fired for that block. Other attacks on t
 ### Tests
 
 ```bash
-protect/test/run.sh            # 6 scenarios on servers simulated in Docker: install, blocking, false positives, uninstall
+protect/test/run.sh            # 6 scenarios on servers simulated in Docker: install, menu, blocking, false positives, updates, uninstall
 protect/test/run.sh rocky9     # just one
 ```
 
@@ -136,11 +175,11 @@ GitHub Actions runs ShellCheck on every push. It runs these scenarios in paralle
 Change `VERSION` in `protect/protect.sh`, commit, then push a matching tag:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
-The release workflow runs all the test scenarios first. It only publishes `protect.sh`, `SHA256SUMS` and the provenance attestation if they all pass and the tag matches `VERSION`.
+The release workflow runs all the test scenarios first. It only publishes `protect.sh`, `SHA256SUMS`, `VERSION` and the provenance attestation if they all pass and the tag matches `VERSION`.
 
 ---
 
@@ -246,12 +285,12 @@ scripts/                  test and report scripts for the lab
 curl -fsSL https://github.com/shianjeng/waf-lab/releases/latest/download/protect.sh | sudo bash
 ```
 
-要加选项的话，写在 `bash -s --` 后面，比如 `... | sudo bash -s -- --strict`。想先检查脚本再运行，见[校验下载的文件](#校验下载的文件)。
+要加选项的话，写在 `bash -s --` 后面，比如 `... | sudo bash -s -- --strict`。想先检查脚本再运行，见[校验下载的文件](#校验下载的文件)。服务器连不上 GitHub 的话，见[不能访问 GitHub 时怎么安装](#不能访问-github-时怎么安装)。
 
 它会先列出要做的事情，你确认之后才会动手：
 
 ```
-protect.sh 0.1.0 将要在这台服务器上做以下事情：
+protect 0.2.0 将要在这台服务器上做以下事情：
   系统：Ubuntu 24.04 LTS · Web 服务器：Nginx 1.24.0
   防护级别：完整（请求到达网站之前就检测，攻击请求直接返回 403）
 
@@ -262,6 +301,24 @@ protect.sh 0.1.0 将要在这台服务器上做以下事情：
 ```
 
 防护用的是 [CrowdSec](https://www.crowdsec.net)。第 4 步会自动识别你当前 SSH 登录用的 IP 并加入白名单，避免输错几次密码就把自己封在外面。
+
+### 装好以后：`sudo protect`
+
+安装时会顺便装一个 `protect` 命令。以后随时运行 `sudo protect` 就能打开管理菜单，不用记任何选项：
+
+```
+protect 0.2.0 · 防护级别：完整
+
+  1. 查看防护状态
+  2. 正常用户被拦了，查看并放行
+  3. 查看或撤销已放行的例外
+  4. 解封一个 IP
+  5. 检查更新
+  6. 卸载
+  0. 退出
+```
+
+菜单里的每一项也都有对应的[选项](#选项)，方便写进脚本。
 
 ### 校验下载的文件
 
@@ -281,7 +338,13 @@ sudo bash protect.sh
 gh attestation verify protect.sh --repo shianjeng/waf-lab
 ```
 
-要安装指定版本，把网址里的 `latest/download` 换成 `download/v0.1.0`。`bash protect.sh --version` 可以查看当前版本。
+要安装指定版本，把网址里的 `latest/download` 换成 `download/v0.2.0`。`bash protect.sh --version` 可以查看当前版本。
+
+### 不能访问 GitHub 时怎么安装
+
+如果服务器连不上 GitHub，或者很慢（国内服务器常见），可以先在自己电脑上从[最新版本页面](https://github.com/shianjeng/waf-lab/releases/latest)下载 `protect.sh`，用 `scp` 或者宝塔的文件管理上传到服务器，再运行 `sudo bash protect.sh`。`protect` 命令会直接从上传的文件安装。
+
+安装 CrowdSec 本身仍然需要服务器能访问 CrowdSec 的软件源，`--update` 也需要能访问 GitHub。
 
 ### 两种防护级别
 
@@ -297,8 +360,10 @@ gh attestation verify protect.sh --repo shianjeng/waf-lab
 
 ### 正常用户被拦了怎么办
 
+在菜单里选 2，或者运行：
+
 ```bash
-sudo bash protect.sh --blocks
+sudo protect --blocks
 ```
 
 ```
@@ -317,12 +382,16 @@ sudo bash protect.sh --blocks
   2. 全站放行
 请选择 [1/2]：1
 已在 /search 放行这 1 条规则（新增 1 条例外），其他路径照常检测。
-反悔了可以用 sudo bash protect.sh --exceptions 查看，再按编号删除。
+反悔了可以用 sudo protect --exceptions 查看，再按编号删除。
 ```
 
 放行只针对这次拦截命中的那几条规则。同一个路径上的其他攻击（比如 XSS、命令注入）仍然会被拦。
 
-| 命令 | 作用 |
+### 选项
+
+用法是 `sudo protect <选项>`。不加选项运行 `sudo protect` 会打开菜单。
+
+| 选项 | 作用 |
 |---|---|
 | `--blocks` | 查看最近被拦截的请求，输入编号放行 |
 | `--allow-block 编号` | 不用交互直接放行，加 `--site-wide` 全站放行 |
@@ -331,14 +400,23 @@ sudo bash protect.sh --blocks
 | `--unban IP` | 解封一个被误封的 IP，可以顺便加入白名单 |
 | `--reset-exceptions` | 清除所有放行例外 |
 | `--status` | 查看防护状态和最近的攻击 |
-| `--strict` | 安装时额外启用 OWASP CRS 规则：拦得更多，误报也更多（见下面的实验室结果） |
-| `--allow-ip IP` | 安装时额外把一个 IP 加入白名单 |
-| `--uninstall` | 卸载 |
+| `--update` | 更新到最新版本，保留现有设置和放行例外 |
+| `--reinstall` | 按现有设置重新安装一遍 |
+| `--strict` | 额外启用 OWASP CRS 规则：拦得更多，误报也更多（见下面的实验室结果） |
+| `--no-strict` | 关掉严格模式 |
+| `--allow-ip IP` | 额外把一个 IP 加入白名单 |
+| `--uninstall` | 卸载，`protect` 命令也一起删除 |
 | `--version` | 显示版本号 |
+
+### 更新
+
+- **规则每天自动更新。** CrowdSec 自带的定时任务（`crowdsec-hubupdate.timer`）每天下载新的虚拟补丁和规则。protect 会确保它是开着的，`--status` 里能看到上次运行的时间。
+- **protect 本身用 `sudo protect --update` 更新**，或者在菜单里选 5。它会下载最新版本，先用 `SHA256SUMS` 校验，通过了才替换。校验不通过就什么都不改。严格模式等设置和放行例外都会保留。有新版本时，菜单和 `--status` 里会提示。
+- **从 0.1.0 升级**（0.1.0 还没有 `protect` 命令）：再运行一遍安装命令，会打开菜单并补装 `protect` 命令。
 
 ### 需要知道的几件事
 
-- **只做防护。** 它只会向你的网站发两个请求：安装结束时向本机 `127.0.0.1` 请求首页和 `/.env`，确认防护已经生效。
+- **只做防护。** 它只会向你的网站发两个请求：安装结束时向本机 `127.0.0.1` 请求首页和 `/.env`，确认防护已经生效。菜单和 `--status` 还会从 GitHub 读取一个几字节的 `VERSION` 文件，看有没有新版本。
 - **它会用 root 权限运行 CrowdSec 的官方安装脚本。** 第 1 步会下载 <https://install.crowdsec.net> 并运行它来添加软件源，这是 CrowdSec 文档里的安装方式。和任何要用 sudo 运行的脚本一样，运行前请先看一遍 `protect.sh`。
 - **CrowdSec 默认会和社区共享数据。** 它会把检测到的攻击者 IP 和攻击类型分享给 CrowdSec 社区，同时下载社区黑名单。不想分享可以参考 [CrowdSec 文档](https://docs.crowdsec.net) 关闭 Central API。
 - **国内服务器** 安装时要从 CrowdSec 的国外软件源下载，可能比较慢。
@@ -348,7 +426,7 @@ sudo bash protect.sh --blocks
 ### 测试
 
 ```bash
-protect/test/run.sh            # 在 Docker 里模拟的服务器上跑 6 个场景：安装、拦截、误报处理和卸载
+protect/test/run.sh            # 在 Docker 里模拟的服务器上跑 6 个场景：安装、菜单、拦截、误报处理、更新和卸载
 protect/test/run.sh rocky9     # 只测一种
 ```
 
@@ -361,11 +439,11 @@ GitHub Actions 会在每次推送时用 ShellCheck 检查脚本；`protect/` 有
 修改 `protect/protect.sh` 里的 `VERSION`，提交，然后推送对应的标签：
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
-发布工作流会先跑完所有测试场景。只有全部通过、并且标签和 `VERSION` 一致，才会发布 `protect.sh`、`SHA256SUMS` 和来源证明。
+发布工作流会先跑完所有测试场景。只有全部通过、并且标签和 `VERSION` 一致，才会发布 `protect.sh`、`SHA256SUMS`、`VERSION` 和来源证明。
 
 ---
 

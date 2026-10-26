@@ -12,6 +12,10 @@ cd "$(dirname "$0")"
 ADMIN=198.51.100.7
 ATTACKER=203.0.113.77
 VERSION=$(sed -nE 's/^VERSION=([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' ../protect.sh)
+# 测试机里模拟的"下一个版本"，用来测 --update
+NEXT=$(printf '%s' "$VERSION" | awk -F. '{ print $1 "." $2 "." $3 + 1 }')
+# protect 命令从这里下载发布文件，指向测试机里模拟的发布目录，不依赖 GitHub 上真实的版本
+REL=file:///root/rel
 # CI 里用 LOGS_DIR 指定日志目录，失败时把日志上传下来
 LOGS=${LOGS_DIR:-$(mktemp -d)}
 mkdir -p "$LOGS"
@@ -37,9 +41,22 @@ start() {
 		sleep 1
 	done
 	docker cp ../protect.sh "pt-$name:/root/protect.sh"
+	fake_release "$name"
 }
 
-in_box() { docker exec "pt-$1" bash -c "$2"; }
+# 在测试机里做一个和 GitHub Releases 目录结构一样的发布：当前版本 $VERSION，
+# 加上一个"最新版本" $NEXT
+fake_release() {
+	docker exec "pt-$1" bash -c "
+		R=/root/rel
+		mkdir -p \$R/download/v$VERSION \$R/latest/download
+		cp /root/protect.sh \$R/download/v$VERSION/
+		(cd \$R/download/v$VERSION && sha256sum protect.sh >SHA256SUMS)
+		sed 's/^VERSION=.*/VERSION=$NEXT/' /root/protect.sh >\$R/latest/download/protect.sh
+		(cd \$R/latest/download && sha256sum protect.sh >SHA256SUMS && echo $NEXT >VERSION)"
+}
+
+in_box() { docker exec -e PROTECT_RELEASES_URL="$REL" "pt-$1" bash -c "$2"; }
 
 expect() {
 	local desc=$1
@@ -57,14 +74,14 @@ http_code() { in_box "$1" "curl -s -o /dev/null -m 5 -w %{http_code} 'http://127
 install_protect() {
 	local name=$1
 	shift
-	docker exec -e SSH_CONNECTION="$ADMIN 51000 10.0.0.2 22" "pt-$name" \
+	docker exec -e SSH_CONNECTION="$ADMIN 51000 10.0.0.2 22" -e PROTECT_RELEASES_URL="$REL" "pt-$name" \
 		bash /root/protect.sh -y "$@" >"$LOGS/$name.install.log" 2>&1
 }
 
 # 模拟 curl ... | sudo bash -s -- -y：脚本从标准输入读进来，而不是从文件运行
 install_protect_piped() {
 	local name=$1
-	docker exec -e SSH_CONNECTION="$ADMIN 51000 10.0.0.2 22" "pt-$name" \
+	docker exec -e SSH_CONNECTION="$ADMIN 51000 10.0.0.2 22" -e PROTECT_RELEASES_URL="$REL" "pt-$name" \
 		bash -c 'cat /root/protect.sh | bash -s -- -y' >"$LOGS/$name.install.log" 2>&1
 }
 
@@ -72,6 +89,7 @@ uninstall_checks() {
 	local name=$1
 	in_box "$name" "bash /root/protect.sh --uninstall -y" >"$LOGS/$name.uninstall.log" 2>&1
 	expect "卸载后 CrowdSec 已移除" in_box "$name" "! command -v cscli"
+	expect "卸载后 protect 命令已删除" in_box "$name" "! test -e /usr/local/bin/protect"
 	expect "卸载后网站仍然正常（200）" test "$(http_code "$name" /)" = 200
 }
 
@@ -127,11 +145,13 @@ full_mode() {
 		echo "== $name（应为完整模式）"
 		expect "安装成功" install_protect "$name"
 	fi
-	expect "安装计划显示了版本号 $VERSION" grep -q "protect.sh $VERSION 将要" "$LOGS/$name.install.log"
+	expect "安装计划显示了版本号 $VERSION" grep -q "protect $VERSION 将要" "$LOGS/$name.install.log"
 	if [ "$prep" = broken-repo ]; then
 		expect "发现并修复了损坏的软件源" grep -q "CrowdSec 软件源没有配置成功" "$LOGS/$name.install.log"
 	fi
+	command_works "$name"
 	status_works "$name"
+	menu_works "$name"
 	expect "选择了完整模式" grep -q "防护级别：完整" "$LOGS/$name.install.log"
 	expect "自检：/.env 被拦截" grep -q "被拦截（403）" "$LOGS/$name.install.log"
 	expect "正常页面不受影响（200）" test "$(http_code "$name" /)" = 200
@@ -141,11 +161,32 @@ full_mode() {
 	uninstall_checks "$name"
 }
 
+command_works() {
+	expect "装好了 protect 命令（$VERSION）" in_box "$1" "protect --version | grep -qx 'protect $VERSION'"
+}
+
 # --status 会读回安装时保存的状态文件，能发现状态文件写坏之类的问题
 status_works() {
+	expect "protect --status 正常，版本一致" in_box "$1" \
+		"protect --status | grep -qF 'protect $VERSION（安装时的版本：$VERSION）'"
+}
+
+# 用伪终端操作菜单：选 1 查看状态，回车返回菜单，再选 0 退出
+menu_works() {
+	expect "sudo protect 打开菜单并能查看状态" in_box "$1" \
+		"printf '1\n\n0\n' | script -qec protect /dev/null 2>&1 | grep -q '规则每天自动更新'"
+}
+
+# 测试机里的"最新版本"是 $NEXT。更新后严格模式等设置要保留，篡改过的新版本要被拒绝
+update_works() {
 	local name=$1
-	expect "--status 正常，版本一致" in_box "$name" \
-		"bash /root/protect.sh --status | grep -qF 'protect.sh $VERSION（安装时的版本：$VERSION）'"
+	expect "protect --update 更新到 $NEXT" in_box "$name" "protect --update -y"
+	expect "更新后版本是 $NEXT" in_box "$name" "protect --version | grep -qx 'protect $NEXT'"
+	expect "更新后仍是严格模式" in_box "$name" "grep -q crs-inband /etc/crowdsec/acquis.d/protect-appsec.yaml"
+	expect "更新后防护仍然生效" test "$(http_code "$name" /.env)" = 403
+	in_box "$name" "echo '# 被篡改' >>/root/rel/latest/download/protect.sh"
+	expect "篡改过的新版本被拒绝" in_box "$name" "protect --update -y 2>&1 | grep -q 校验不通过"
+	expect "被拒绝后版本没变" in_box "$name" "protect --version | grep -qx 'protect $NEXT'"
 }
 
 # 攻击者可以在 URL 路径里编码换行和制表符（%0A、%09），想在管理员放行时顺带写进一条
@@ -168,6 +209,7 @@ strict_false_positive() {
 	echo "== debian12 严格模式 + 误报处理"
 	start "$name" debian12
 	expect "安装成功" install_protect "$name" --strict
+	command_works "$name"
 	status_works "$name"
 	expect "普通句子被 CRS 误拦（403）" test "$(http_code "$name" "$benign")" = 403
 	sleep 2
@@ -189,6 +231,7 @@ strict_false_positive() {
 	expect "--reset-exceptions 成功" in_box "$name" "bash /root/protect.sh --reset-exceptions -y"
 	sleep 6
 	expect "清除例外后恢复拦截" test "$(http_code "$name" "$benign")" = 403
+	update_works "$name"
 	uninstall_checks "$name"
 }
 
@@ -199,6 +242,7 @@ basic_mode() {
 	expect "安装成功" install_protect "$name"
 	expect "选择了基础模式" grep -q "防护级别：基础" "$LOGS/$name.install.log"
 	expect "检查结果显示正在监控日志" grep -q "\[正常\] 正在监控" "$LOGS/$name.install.log"
+	command_works "$name"
 	status_works "$name"
 	expect "正常页面不受影响（200）" test "$(http_code "$name" /)" = 200
 	simulate_scan "$name" "$log"

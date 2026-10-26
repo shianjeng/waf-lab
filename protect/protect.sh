@@ -1,15 +1,9 @@
 #!/usr/bin/env bash
 # 一键给自己服务器上的网站加上 CrowdSec 防护。只做防护，不会向任何地方发送攻击请求。
 #
-#   sudo bash protect.sh               安装（先列出要做的事，确认后才动手）
-#   sudo bash protect.sh --strict      同时启用 OWASP CRS 规则：拦得更多，误报也更多
-#   sudo bash protect.sh --allow-ip IP 额外把一个 IP 加入白名单（可以重复）
-#   sudo bash protect.sh --status      查看防护状态
-#   sudo bash protect.sh --blocks      查看最近拦截的请求，把误拦的放行
-#   sudo bash protect.sh --exceptions  查看已放行的例外，可以按编号删除
-#   sudo bash protect.sh --unban IP    解封一个被误封的 IP
-#   sudo bash protect.sh --uninstall   卸载
-#   加 -y 跳过确认
+# 第一次运行时安装防护，同时把自己装成 /usr/local/bin/protect 命令。之后运行
+# sudo protect 会打开管理菜单：查看状态、放行误拦、解封 IP、更新、卸载。
+# 所有功能也都有对应的选项，见 sudo protect --help。
 #
 # 支持 Debian、Ubuntu、CentOS、Rocky、AlmaLinux、阿里云 Linux、龙蜥、OpenCloudOS 上的 Nginx，
 # 以及宝塔面板的 Nginx。
@@ -21,8 +15,18 @@
 #         攻击者 IP，不改动 Nginx。最先到达的几个攻击请求仍会到达网站。
 set -euo pipefail
 
+# 整个脚本放在一对大括号里，bash 要先读到最后的 } 才开始执行。通过 curl | bash 运行时
+# 脚本来自标准输入，如果边读边执行，中途 cscli、apt-get 这类会读标准输入的命令会把
+# 还没执行的脚本读走，后面的代码就会错乱执行
+{
+
 # 发布时打的标签必须是 v$VERSION，发布工作流会检查
-VERSION=0.1.0
+VERSION=0.2.0
+
+# 装好后的管理命令
+BIN=/usr/local/bin/protect
+# 新版本从这里下载。测试时用 PROTECT_RELEASES_URL 指到本地目录（file://）
+RELEASES=${PROTECT_RELEASES_URL:-https://github.com/shianjeng/waf-lab/releases}
 
 STATE=/etc/crowdsec/protect.env
 APPSEC_ACQUIS=/etc/crowdsec/acquis.d/protect-appsec.yaml
@@ -35,11 +39,10 @@ EXCEPTIONS_YAML=/etc/crowdsec/appsec-configs/protect-exceptions.yaml
 
 usage() {
 	cat <<'EOF'
-用法：sudo bash protect.sh [选项]
+用法：sudo protect [选项]
 
-  （不加选项）         安装防护，先列出要做的事，确认后才动手
-  --strict             同时启用 OWASP CRS 规则：拦得更多，误报也更多（仅完整模式）
-  --allow-ip IP        额外把一个 IP 加入白名单，可以重复
+  （不加选项）         还没安装时：安装防护，先列出要做的事，确认后才动手
+                       已经安装时：打开管理菜单
   --status             查看防护状态和最近拦截的攻击
   --blocks             查看最近被拦截的请求，输入编号把误拦的放行
   --allow-block 编号   不用交互，直接放行某次拦截（只在那个路径；加 --site-wide 全站放行）
@@ -48,6 +51,11 @@ usage() {
                        撤销某个路径上的放行，那类请求会重新被拦截
   --reset-exceptions   清除所有放行例外，恢复默认规则
   --unban IP           解封一个被误封的 IP，可以顺便加入白名单
+  --update             更新到最新版本（先校验，保留现有设置和放行例外）
+  --reinstall          按现有设置重新安装一遍
+  --strict             安装时同时启用 OWASP CRS 规则：拦得更多，误报也更多（仅完整模式）
+  --no-strict          关掉严格模式
+  --allow-ip IP        安装时额外把一个 IP 加入白名单，可以重复
   --uninstall          卸载
   --version            显示版本号
   -y                   跳过确认
@@ -59,9 +67,12 @@ step() { printf '\n==> %s\n' "$*"; }
 warn() { printf '注意：%s\n' "$*" >&2; }
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
 
-action=install
+# 不指定动作时，已经安装过就打开菜单，否则安装
+action=""
 assume_yes=0
 strict=0
+# 记录用户有没有明确指定严格模式。没指定时，重新安装沿用上次的设置
+strict_set=0
 site_wide=0
 extra_ips=()
 unban_ip=""
@@ -70,12 +81,24 @@ exception_id=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 	-y | --yes) assume_yes=1 ;;
-	--strict) strict=1 ;;
+	--strict)
+		strict=1
+		strict_set=1
+		action=install
+		;;
+	--no-strict)
+		strict=0
+		strict_set=1
+		action=install
+		;;
 	--allow-ip)
 		[ $# -ge 2 ] || die "--allow-ip 后面要跟一个 IP"
 		extra_ips+=("$2")
+		action=install
 		shift
 		;;
+	--reinstall) action=install ;;
+	--update) action=update ;;
 	--status) action=status ;;
 	--blocks) action=blocks ;;
 	--allow-block)
@@ -105,7 +128,7 @@ while [ $# -gt 0 ]; do
 		exit 0
 		;;
 	--version)
-		say "protect.sh $VERSION"
+		say "protect $VERSION"
 		exit 0
 		;;
 	*) die "不认识的参数：$1（用 --help 查看用法）" ;;
@@ -113,11 +136,15 @@ while [ $# -gt 0 ]; do
 	shift
 done
 
-[ "$(id -u)" -eq 0 ] || die "需要 root 权限，请用 sudo bash protect.sh"
+[ "$(id -u)" -eq 0 ] || die "需要 root 权限，请在命令前面加 sudo"
 
 # 通过 curl | sudo bash 运行时，标准输入是脚本本身，要从终端读回答。
 # 只看 /dev/tty 存不存在不够：没有终端时它存在但打不开
 have_tty() { { true >/dev/tty; } 2>/dev/null; }
+
+if [ -z "$action" ]; then
+	if [ -f "$STATE" ] && [ "$assume_yes" -eq 0 ] && have_tty; then action=menu; else action=install; fi
+fi
 
 confirm() {
 	[ "$assume_yes" -eq 1 ] && return 0
@@ -205,12 +232,12 @@ retry() {
 
 pkg_install() {
 	case "$PKG" in
-	apt) retry env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null ;;
-	*) retry "$PKG" install -y -q "$@" >/dev/null ;;
+	apt) retry env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" </dev/null >/dev/null ;;
+	*) retry "$PKG" install -y -q "$@" </dev/null >/dev/null ;;
 	esac
 }
 
-hub_install() { retry cscli collections install "$@" >/dev/null; }
+hub_install() { retry cscli collections install "$@" </dev/null >/dev/null; }
 
 pkg_remove() {
 	case "$PKG" in
@@ -304,7 +331,7 @@ choose_mode() {
 
 show_plan() {
 	say ""
-	say "protect.sh $VERSION 将要在这台服务器上做以下事情："
+	say "protect $VERSION 将要在这台服务器上做以下事情："
 	say "  系统：$OS_NAME · Web 服务器：$WEB_NAME"
 	if [ "$MODE" = full ]; then
 		say "  防护级别：完整（请求到达网站之前就检测，攻击请求直接返回 403）"
@@ -367,9 +394,19 @@ labels:
 EOF
 }
 
-install() {
+do_install() {
 	detect_os
 	detect_web
+
+	# 重新安装（包括更新后自动重装）时沿用上次的严格模式设置，
+	# 除非这次明确指定了 --strict 或 --no-strict
+	if [ -f "$STATE" ] && [ "$strict_set" -eq 0 ]; then
+		# shellcheck disable=SC1090
+		strict=$(
+			. "$STATE"
+			printf '%s' "${STRICT:-0}"
+		)
+	fi
 
 	ALLOW_IPS=()
 	local ip
@@ -396,6 +433,8 @@ install() {
 	pkg_install crowdsec
 	# 安装时会自动识别 Nginx、SSH 并启用对应规则；这里再装一遍确保齐全
 	hub_install crowdsecurity/nginx crowdsecurity/base-http-scenarios crowdsecurity/http-cve
+	# CrowdSec 自带每天更新规则的定时任务，默认开启。确保它开着，规则才不会过时
+	systemctl enable --now crowdsec-hubupdate.timer >/dev/null 2>&1 || true
 	if [ "$WEB" = baota ]; then
 		cat >"$BAOTA_ACQUIS" <<'EOF'
 # 由 protect.sh 生成：宝塔把各站点的日志放在 /www/wwwlogs
@@ -446,15 +485,24 @@ EOF
 	# 这个文件之后会被 source，所以每个值都要转义，免得空格、括号之类的字符变成语法错误
 	printf 'MODE=%q\nWEB=%q\nSTRICT=%q\nINSTALLED_VERSION=%q\n' "$MODE" "$WEB" "$strict" "$VERSION" >"$STATE"
 
+	step "安装 protect 管理命令"
+	local manage="sudo protect"
+	if install_command; then
+		say "已安装：$BIN"
+	else
+		warn "没能安装 protect 命令（下载或校验失败）。以后重新运行一遍安装命令，同样能打开管理菜单"
+		manage="重新运行安装命令"
+	fi
+
 	step "检查"
 	check || warn "有组件没有正常运行，按上面的提示排查"
 	cat <<EOF
 
-完成。常用命令：
-  sudo bash protect.sh --status          查看防护状态和最近拦截的攻击
-  sudo bash protect.sh --blocks          正常用户被拦了？在这里找到那次拦截并放行
-  sudo bash protect.sh --unban IP        解封一个被误封的 IP
-  sudo bash protect.sh --uninstall       卸载
+完成。以后在服务器上运行：
+
+  $manage
+
+就能打开管理菜单：查看状态、放行被误拦的正常用户、解封 IP、更新、卸载。
 EOF
 }
 
@@ -508,28 +556,201 @@ check() {
 			ok=0
 		fi
 	fi
+	if systemctl is-enabled --quiet crowdsec-hubupdate.timer 2>/dev/null; then
+		local last
+		last=$(systemctl show -p LastTriggerUSec --value crowdsec-hubupdate.timer 2>/dev/null || true)
+		case "$last" in
+		"" | n/a | 0) last="每天运行一次，还没运行过" ;;
+		*) last="上次：$last" ;;
+		esac
+		say "  [正常] 规则每天自动更新（$last）"
+	else
+		say "  [异常] 规则自动更新没有开启，运行 sudo systemctl enable --now crowdsec-hubupdate.timer 打开"
+		ok=0
+	fi
 	[ "$ok" -eq 1 ]
 }
 
 load_state() {
-	[ -f "$STATE" ] || die "这台服务器还没有用 protect.sh 安装防护"
+	[ -f "$STATE" ] || die "这台服务器还没有安装防护，先运行一遍安装命令"
 	# shellcheck disable=SC1090
 	. "$STATE"
 }
 
 status() {
 	load_state
-	say "protect.sh $VERSION（安装时的版本：${INSTALLED_VERSION:-未知}）"
+	say "protect $VERSION（安装时的版本：${INSTALLED_VERSION:-未知}）"
+	local latest
+	latest=$(latest_version)
+	if [ -n "$latest" ] && version_gt "$latest" "$VERSION"; then
+		say "有新版本 $latest，运行 sudo protect --update 更新"
+	fi
 	if [ "$MODE" = full ]; then say "防护级别：完整"; else say "防护级别：基础"; fi
 	check || true
 	say ""
 	say "当前封禁的 IP：$(cscli decisions list -o raw 2>/dev/null | tail -n +2 | grep -c . || true) 个"
 	if [ "$MODE" = full ]; then
-		say "放行例外：$(grep -c . "$EXCEPTIONS_LIST" 2>/dev/null || echo 0) 条"
+		# 没有例外时 grep -c 输出 0 但返回失败，不能再接 || echo 0，否则会多打一个 0
+		local exc
+		exc=$(grep -c . "$EXCEPTIONS_LIST" 2>/dev/null || true)
+		say "放行例外：${exc:-0} 条"
 	fi
 	say ""
 	say "最近的攻击："
 	cscli alerts list -l 10 2>/dev/null || true
+}
+
+# ---- protect 命令、更新和菜单 ----
+
+# 从脚本文件里读版本号，不执行它
+file_version() { sed -nE 's/^VERSION=([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' "$1" 2>/dev/null; }
+
+version_gt() {
+	[ "$1" != "$2" ] && [ "$(printf '%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]
+}
+
+# 最新发布的版本号。只用来提示有没有新版本，拿不到（比如没网）就不提示
+latest_version() {
+	local v
+	v=$(curl -fsSL -m 5 "$RELEASES/latest/download/VERSION" 2>/dev/null || true)
+	v=$(printf '%s' "$v" | tr -d '[:space:]')
+	if [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then printf '%s' "$v"; fi
+	return 0
+}
+
+# 下载某个发布版本的 protect.sh，用同一版本的 SHA256SUMS 校验。where 是
+# latest/download 或 download/vX.Y.Z。返回 1 表示下载失败，2 表示校验不通过
+fetch_release() {
+	local where=$1 dir=$2
+	retry curl -fsSL -o "$dir/protect.sh" "$RELEASES/$where/protect.sh" || return 1
+	retry curl -fsSL -o "$dir/SHA256SUMS" "$RELEASES/$where/SHA256SUMS" || return 1
+	(cd "$dir" && sha256sum --check --quiet SHA256SUMS >/dev/null 2>&1) || return 2
+}
+
+# 先写到临时文件再改名：正在运行的 protect 命令不会读到写了一半的文件
+put_command() { install -m 755 "$1" "$BIN.new" && mv -f "$BIN.new" "$BIN"; }
+
+# 把脚本装成 protect 命令。从文件运行时直接复制自己；通过 curl | bash 运行时脚本
+# 不在磁盘上，就下载同一版本的发布文件，校验通过才装
+install_command() {
+	local src=${BASH_SOURCE[0]:-} tmp ok=0
+	if [ -f "$src" ] && [ "$(file_version "$src")" = "$VERSION" ]; then
+		[ "$(readlink -f "$src")" = "$(readlink -f "$BIN")" ] && return 0
+		put_command "$src"
+		return
+	fi
+	tmp=$(mktemp -d)
+	if fetch_release "download/v$VERSION" "$tmp" && [ "$(file_version "$tmp/protect.sh")" = "$VERSION" ]; then
+		put_command "$tmp/protect.sh" && ok=1
+	fi
+	rm -rf "$tmp"
+	[ "$ok" -eq 1 ]
+}
+
+update() {
+	load_state
+	local tmp new rc=0
+	tmp=$(mktemp -d)
+	say "正在下载最新版本并校验……"
+	fetch_release latest/download "$tmp" || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		rm -rf "$tmp"
+		if [ "$rc" -eq 2 ]; then
+			die "校验不通过：下载到的文件和发布的校验值对不上，可能被篡改或下载损坏。没有做任何改动"
+		fi
+		die "下载失败，没有做任何改动。多半是网络问题，稍后再试"
+	fi
+	new=$(file_version "$tmp/protect.sh")
+	if [ -z "$new" ] || ! version_gt "$new" "$VERSION"; then
+		rm -rf "$tmp"
+		say "已经是最新版本（$VERSION）。"
+		return 0
+	fi
+	say "发现新版本：$VERSION → $new"
+	say "更新说明：$RELEASES/tag/v$new"
+	if ! confirm "现在更新吗？现有的设置和放行例外都会保留"; then
+		rm -rf "$tmp"
+		die "已取消"
+	fi
+	put_command "$tmp/protect.sh"
+	rm -rf "$tmp"
+	say "已更新到 $new，按原有设置重新应用一遍配置……"
+	# 换成新版本继续执行，新版本里的配置改动这样才会生效
+	exec "$BIN" --reinstall -y
+}
+
+pause() {
+	have_tty || return 0
+	printf '\n按回车返回菜单……' >/dev/tty
+	read -r _ </dev/tty || true
+}
+
+# 给不想记选项的用户用。每个操作放在子 shell 里跑，出错只结束这一项，回到菜单
+menu() {
+	load_state
+	# 从 0.1.0 升级上来的服务器还没有 protect 命令，顺手补上
+	[ -x "$BIN" ] || install_command >/dev/null 2>&1 || true
+	local latest choice ip n level
+	latest=$(latest_version)
+	if [ "$MODE" = full ]; then level="完整"; else level="基础"; fi
+	while true; do
+		say ""
+		say "protect $VERSION · 防护级别：$level"
+		if [ -n "$latest" ] && version_gt "$latest" "$VERSION"; then
+			say "有新版本 $latest，选 5 更新"
+		fi
+		say ""
+		say "  1. 查看防护状态"
+		if [ "$MODE" = full ]; then
+			say "  2. 正常用户被拦了，查看并放行"
+			say "  3. 查看或撤销已放行的例外"
+		fi
+		say "  4. 解封一个 IP"
+		say "  5. 检查更新"
+		say "  6. 卸载"
+		say "  0. 退出"
+		printf '\n请选择：' >/dev/tty
+		read -r choice </dev/tty || return 0
+		case "$choice" in
+		1) (status) || true ;;
+		2) if [ "$MODE" = full ]; then (blocks) || true; fi ;;
+		3)
+			if [ "$MODE" = full ]; then
+				(
+					exceptions
+					if grep -q . "$EXCEPTIONS_LIST" 2>/dev/null; then
+						printf '\n输入编号撤销（直接回车返回）：' >/dev/tty
+						read -r n </dev/tty || true
+						if [ -n "$n" ]; then remove_exception "$n"; fi
+					fi
+				) || true
+			fi
+			;;
+		4)
+			printf '要解封的 IP：' >/dev/tty
+			read -r ip </dev/tty || true
+			if [ -n "$ip" ]; then (unban "$ip") || true; fi
+			;;
+		5)
+			(update) || true
+			# 更新成功后磁盘上的 protect 已经是新版本，退出菜单，免得继续用旧版本操作
+			if [ "$(file_version "$BIN")" != "$VERSION" ]; then
+				say "重新运行 sudo protect 打开新版本的菜单。"
+				return 0
+			fi
+			;;
+		6)
+			(uninstall) || true
+			return 0
+			;;
+		0 | q | Q | "") return 0 ;;
+		*)
+			say "请输入菜单里的数字"
+			continue
+			;;
+		esac
+		pause
+	done
 }
 
 # ---- 误报处理 ----
@@ -595,7 +816,7 @@ write_exceptions() {
 	local tab=$'\t' path name
 	{
 		echo "# 由 protect.sh 生成，不要手动修改。"
-		echo "# 用 protect.sh --blocks 添加例外，用 protect.sh --reset-exceptions 全部清除。"
+		echo "# 用 sudo protect --blocks 添加例外，用 sudo protect --reset-exceptions 全部清除。"
 		echo "name: protect/exceptions"
 		if grep -q "^\*$tab" "$EXCEPTIONS_LIST"; then
 			echo "on_load:"
@@ -629,7 +850,7 @@ blocks() {
 		say "基础模式下没有网站层面的拦截，只会按 IP 封禁。当前封禁的 IP："
 		cscli decisions list 2>/dev/null || true
 		say ""
-		say "如果正常用户的 IP 被封了：sudo bash protect.sh --unban <IP>"
+		say "如果正常用户的 IP 被封了：sudo protect --unban <IP>"
 		return
 	fi
 	local rows id ip time t uri method msgs
@@ -649,7 +870,7 @@ blocks() {
 	done <<<"$rows"
 	say ""
 	if ! have_tty; then
-		say "放行某次拦截：sudo bash protect.sh --allow-block <编号>"
+		say "放行某次拦截：sudo protect --allow-block <编号>"
 		return
 	fi
 	local choice
@@ -715,7 +936,7 @@ allow_block() {
 	else
 		say "已在 $path 放行这 $count 条规则（新增 $added 条例外），其他路径照常检测。"
 	fi
-	say "反悔了可以用 sudo bash protect.sh --exceptions 查看，再按编号删除。"
+	say "反悔了可以用 sudo protect --exceptions 查看，再按编号删除。"
 }
 
 # 例外里的规则名换成人看得懂的说法
@@ -746,7 +967,7 @@ exceptions() {
 		printf '  [%d] %s：%s\n' "$n" "$(path_label "$path")" "$rules"
 	done < <(exception_paths)
 	say ""
-	say "撤销某个路径上的放行：sudo bash protect.sh --remove-exception <编号>"
+	say "撤销某个路径上的放行：sudo protect --remove-exception <编号>"
 }
 
 remove_exception() {
@@ -800,12 +1021,14 @@ uninstall() {
 		if nginx -t >/dev/null 2>&1; then systemctl reload nginx; fi
 	fi
 	pkg_remove crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables crowdsec
-	rm -f "$STATE" "$APPSEC_ACQUIS" "$BAOTA_ACQUIS" "$EXCEPTIONS_LIST" "$EXCEPTIONS_YAML"
-	say "已卸载。CrowdSec 的软件源配置仍然保留，不影响系统使用。"
+	rm -f "$STATE" "$APPSEC_ACQUIS" "$BAOTA_ACQUIS" "$EXCEPTIONS_LIST" "$EXCEPTIONS_YAML" "$BIN"
+	say "已卸载，protect 命令也已删除。CrowdSec 的软件源配置仍然保留，不影响系统使用。"
 }
 
 case "$action" in
-install) install ;;
+install) do_install ;;
+menu) menu ;;
+update) update ;;
 status) status ;;
 blocks) blocks ;;
 allow_block)
@@ -819,3 +1042,6 @@ remove_exception) remove_exception "$exception_id" ;;
 reset_exceptions) reset_exceptions ;;
 uninstall) uninstall ;;
 esac
+
+# 和开头的 { 配对，见开头的说明
+}

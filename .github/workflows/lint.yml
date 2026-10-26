@@ -26,4 +26,4 @@ jobs:
 
       # 不用 root 也要能看版本号，版本号格式要能和发布标签对上
       - name: protect.sh --version
-        run: bash protect/protect.sh --version | grep -E '^protect\.sh [0-9]+\.[0-9]+\.[0-9]+$'
+        run: bash protect/protect.sh --version | grep -E '^protect [0-9]+\.[0-9]+\.[0-9]+$'

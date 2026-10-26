@@ -32,13 +32,15 @@ jobs:
             exit 1
           fi
 
+      # VERSION 只有几个字节，protect 命令用它判断有没有新版本，不用每次下载整个脚本
       - name: Build release files
         run: |
           mkdir dist
           cp protect/protect.sh dist/
+          printf '%s\n' "${GITHUB_REF_NAME#v}" >dist/VERSION
           cd dist
           sha256sum protect.sh >SHA256SUMS
-          cat SHA256SUMS
+          cat SHA256SUMS VERSION
 
       # 来源证明证明这个文件是由本仓库的这个工作流构建的。私有仓库用不了这个功能
       - name: Attest provenance
@@ -51,5 +53,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/protect.sh dist/SHA256SUMS \
+          gh release create "$GITHUB_REF_NAME" dist/protect.sh dist/SHA256SUMS dist/VERSION \
             --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
