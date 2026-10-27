@@ -201,13 +201,15 @@ notify_works() {
 	local name=$1 send="PROTECT_NOTIFY_ENDPOINT=http://127.0.0.1:8099/"
 	docker cp mockbot.sh "pt-$name:/root/mockbot.sh"
 	in_box "$name" "(nohup bash /root/mockbot.sh >/dev/null 2>&1 &)"
-	sleep 1
+	in_box "$name" "for i in \$(seq 50); do ss -ltn | grep -q 127.0.0.1:8099 && break; sleep 0.1; done"
 	expect "不是官方机器人地址的被拒绝" in_box "$name" "! protect --notify https://example.com/hook"
+	# 模拟机器人一直在线，第一次就该发成功。靠重试才发出去，说明发送有问题
 	expect "设置推送，收到测试消息" in_box "$name" \
-		"$send protect --notify 'https://oapi.dingtalk.com/robot/send?access_token=test' && grep -aq 推送已开启 /root/received.txt"
+		"$send protect --notify 'https://oapi.dingtalk.com/robot/send?access_token=test' >/root/send.log 2>&1 && ! grep -q 重试 /root/send.log && grep -aq 推送已开启 /root/received.txt"
 	expect "每天定时发送已开启" in_box "$name" "systemctl is-enabled --quiet protect-report.timer"
 	expect "机器人地址只有 root 能读" in_box "$name" "test \"\$(stat -c %a /etc/crowdsec/protect-notify.env)\" = 600"
-	expect "日报发到了机器人" in_box "$name" "$send protect --report --send && grep -aq 防护日报 /root/received.txt"
+	expect "日报发到了机器人" in_box "$name" \
+		"$send protect --report --send >/root/send.log 2>&1 && ! grep -q 重试 /root/send.log && grep -aq 防护日报 /root/received.txt"
 	expect "关闭推送后定时任务和配置都删掉了" in_box "$name" \
 		"protect --notify-off && ! test -e /etc/systemd/system/protect-report.timer && ! test -e /etc/crowdsec/protect-notify.env"
 }
