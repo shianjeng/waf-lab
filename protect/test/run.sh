@@ -177,6 +177,41 @@ menu_works() {
 		"printf '1\n\n0\n' | script -qec protect /dev/null 2>&1 | grep -q '规则每天自动更新'"
 }
 
+# 让 Nginx 认 X-Forwarded-For 里的 IP，模拟不同访客（文档专用地址段）：3 个访客正常打开
+# 首页，3 个访客在首页被误拦，3 个扫描者探测 /.env。首页应提示可能误报，/.env 不应该
+fp_and_report_works() {
+	local name=$1
+	in_box "$name" "printf 'set_real_ip_from 127.0.0.1;\nreal_ip_header X-Forwarded-For;\n' >/etc/nginx/conf.d/00-test-realip.conf
+		systemctl reload nginx
+		# reload 是异步的，旧的 worker 还会处理一小会儿请求，那时还不认 X-Forwarded-For
+		sleep 2
+		visit() { curl -s -o /dev/null -H \"X-Forwarded-For: 203.0.113.\$1\" \"http://127.0.0.1\$2\"; }
+		for i in 11 12 13; do visit \$i '/?ref=home'; done
+		for i in 21 22 23; do visit \$i '/?q=zsh%20is%20the%20best%21'; done
+		for i in 31 32 33; do visit \$i '/.env'; done"
+	sleep 3
+	expect "首页被多个访客误拦，提示可能误报" in_box "$name" "protect --status | grep -q '^  /：3 个访客被拦截'"
+	expect "/.env 只有扫描，不算误报" in_box "$name" "! protect --status | grep -q '^  /.env：'"
+	expect "protect --report 列出拦截和可能的误报" in_box "$name" \
+		"protect --report | grep -q '网站防护拦截了' && protect --report | grep -q '可能的误报'"
+}
+
+# 每日简报推送：发到测试机里模拟的钉钉机器人（mockbot.sh）
+notify_works() {
+	local name=$1 send="PROTECT_NOTIFY_ENDPOINT=http://127.0.0.1:8099/"
+	docker cp mockbot.sh "pt-$name:/root/mockbot.sh"
+	in_box "$name" "(nohup bash /root/mockbot.sh >/dev/null 2>&1 &)"
+	sleep 1
+	expect "不是官方机器人地址的被拒绝" in_box "$name" "! protect --notify https://example.com/hook"
+	expect "设置推送，收到测试消息" in_box "$name" \
+		"$send protect --notify 'https://oapi.dingtalk.com/robot/send?access_token=test' && grep -aq 推送已开启 /root/received.txt"
+	expect "每天定时发送已开启" in_box "$name" "systemctl is-enabled --quiet protect-report.timer"
+	expect "机器人地址只有 root 能读" in_box "$name" "test \"\$(stat -c %a /etc/crowdsec/protect-notify.env)\" = 600"
+	expect "日报发到了机器人" in_box "$name" "$send protect --report --send && grep -aq 防护日报 /root/received.txt"
+	expect "关闭推送后定时任务和配置都删掉了" in_box "$name" \
+		"protect --notify-off && ! test -e /etc/systemd/system/protect-report.timer && ! test -e /etc/crowdsec/protect-notify.env"
+}
+
 # 测试机里的"最新版本"是 $NEXT。更新后严格模式等设置要保留，篡改过的新版本要被拒绝
 update_works() {
 	local name=$1
@@ -231,6 +266,8 @@ strict_false_positive() {
 	expect "--reset-exceptions 成功" in_box "$name" "bash /root/protect.sh --reset-exceptions -y"
 	sleep 6
 	expect "清除例外后恢复拦截" test "$(http_code "$name" "$benign")" = 403
+	fp_and_report_works "$name"
+	notify_works "$name"
 	update_works "$name"
 	uninstall_checks "$name"
 }

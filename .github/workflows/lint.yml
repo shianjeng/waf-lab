@@ -19,7 +19,7 @@ jobs:
         run: |
           command -v shellcheck >/dev/null || sudo apt-get install -y shellcheck
           shellcheck --version | head -2
-          shellcheck -S warning waflab protect/protect.sh protect/test/run.sh scripts/*.sh
+          shellcheck -S warning waflab protect/protect.sh protect/test/run.sh protect/test/mockbot.sh scripts/*.sh
 
       - name: Python syntax
         run: python3 -m py_compile scripts/*.py

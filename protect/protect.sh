@@ -21,7 +21,7 @@ set -euo pipefail
 {
 
 # 发布时打的标签必须是 v$VERSION，发布工作流会检查
-VERSION=0.2.0
+VERSION=0.3.0
 
 # 装好后的管理命令
 BIN=/usr/local/bin/protect
@@ -36,6 +36,12 @@ ALLOWLIST=protect-admin
 # 误报例外：每行"路径<TAB>规则"，路径为 * 表示全站。YAML 由它生成，用户不用手写
 EXCEPTIONS_LIST=/etc/crowdsec/protect-exceptions.list
 EXCEPTIONS_YAML=/etc/crowdsec/appsec-configs/protect-exceptions.yaml
+# 每日简报推送：机器人地址（只有 root 能读）和每天定时发送的 systemd 单元
+NOTIFY_FILE=/etc/crowdsec/protect-notify.env
+REPORT_SERVICE=/etc/systemd/system/protect-report.service
+REPORT_TIMER=/etc/systemd/system/protect-report.timer
+# 同一个页面被拦的不同访客、正常打开过它的不同访客，都达到这个数才提示可能误报
+FP_MIN=3
 
 usage() {
 	cat <<'EOF'
@@ -51,6 +57,9 @@ usage() {
                        撤销某个路径上的放行，那类请求会重新被拦截
   --reset-exceptions   清除所有放行例外，恢复默认规则
   --unban IP           解封一个被误封的 IP，可以顺便加入白名单
+  --report             显示过去 24 小时的防护简报（加 --send 发到已设置的群机器人）
+  --notify [地址]      设置每日简报推送到钉钉、企业微信或飞书群机器人
+  --notify-off         关闭每日简报推送
   --update             更新到最新版本（先校验，保留现有设置和放行例外）
   --reinstall          按现有设置重新安装一遍
   --strict             安装时同时启用 OWASP CRS 规则：拦得更多，误报也更多（仅完整模式）
@@ -78,6 +87,8 @@ extra_ips=()
 unban_ip=""
 block_id=""
 exception_id=""
+send_report=0
+notify_url=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 	-y | --yes) assume_yes=1 ;;
@@ -99,6 +110,16 @@ while [ $# -gt 0 ]; do
 		;;
 	--reinstall) action=install ;;
 	--update) action=update ;;
+	--report) action=report ;;
+	--send) send_report=1 ;;
+	--notify)
+		action=notify
+		if [ $# -ge 2 ] && [[ "$2" == http* ]]; then
+			notify_url=$2
+			shift
+		fi
+		;;
+	--notify-off) action=notify_off ;;
 	--status) action=status ;;
 	--blocks) action=blocks ;;
 	--allow-block)
@@ -237,7 +258,8 @@ pkg_install() {
 	esac
 }
 
-hub_install() { retry cscli collections install "$@" </dev/null >/dev/null; }
+# 网络卡住时 cscli 会一直等下去，重试也就无从谈起。每次最多等 3 分钟
+hub_install() { retry timeout 180 cscli collections install "$@" </dev/null >/dev/null; }
 
 pkg_remove() {
 	case "$PKG" in
@@ -286,7 +308,7 @@ add_repo() {
 	fi
 	for n in 1 2 3; do
 		if ! repo_present; then
-			out=$(curl -fsSL https://install.crowdsec.net | env ${override[@]+"${override[@]}"} sh 2>&1) || true
+			out=$(curl -fsSL --connect-timeout 15 -m 120 https://install.crowdsec.net | env ${override[@]+"${override[@]}"} sh 2>&1) || true
 		fi
 		repo_works && return 0
 		# 官方脚本下载签名密钥失败时不会报错，会留下一个没有密钥、用不了的软件源，
@@ -594,10 +616,323 @@ status() {
 		local exc
 		exc=$(grep -c . "$EXCEPTIONS_LIST" 2>/dev/null || true)
 		say "放行例外：${exc:-0} 条"
+		local fps
+		fps=$(top_fps)
+		if [ -n "$fps" ]; then
+			say ""
+			say "可能的误报（过去 24 小时），运行 sudo protect --blocks 处理："
+			say "$fps"
+		fi
 	fi
+	notify_status
 	say ""
 	say "最近的攻击："
 	cscli alerts list -l 10 2>/dev/null || true
+}
+
+# ---- 统计、可能的误报和每日简报 ----
+
+# 把 cscli 的 JSON 记录整理成一行一条：类型、来源 IP、攻击类型、路径、命中的规则（逗号分隔）。
+# 这份 JSON 一行一个字段，用 awk 逐行读就行，服务器上不用另外装 jq 或 Python
+alerts_tsv() {
+	cscli alerts list -o json --since "$1" -l 0 2>/dev/null | awk '
+		function val(s) {
+			sub(/^[^:]*: *"/, "", s)
+			sub(/",?$/, "", s)
+			gsub(/\\u003c/, "<", s)
+			gsub(/\\u003e/, ">", s)
+			gsub(/\\u0026/, "\\&", s)
+			gsub(/\\"/, "\"", s)
+			gsub(/\t/, " ", s)
+			return s
+		}
+		/^ \{/ { kind = ip = scen = uri = rules = want = ""; split("", seen); next }
+		/^  "kind": / { kind = val($0); next }
+		/^  "scenario": / { scen = val($0); next }
+		/^   "ip": / { ip = val($0); next }
+		/"key": "uri"/ { want = "uri"; next }
+		/"key": "rule_name"/ { want = "rule"; next }
+		/"key": / { want = ""; next }
+		/"value": / && want != "" {
+			v = val($0)
+			if (want == "uri" && uri == "") uri = v
+			if (want == "rule" && !(v in seen)) {
+				seen[v] = 1
+				rules = rules (rules == "" ? "" : ",") v
+			}
+			want = ""
+			next
+		}
+		/^ \}/ { if (kind != "") printf "%s\t%s\t%s\t%s\t%s\n", kind, ip, scen, uri, rules }
+	'
+}
+
+# Nginx 的访问日志，当前的和上一次轮转的
+access_logs() {
+	compgen -G "/var/log/nginx/*access*.log" || true
+	compgen -G "/var/log/nginx/*access*.log.1" || true
+}
+
+# 可能的误报：过去 24 小时里，同一个页面被拦的不同访客有 FP_MIN 个以上，访问日志里也有
+# FP_MIN 个以上不同访客正常打开过这个页面（2xx、3xx）。真正的攻击通常来自少数几个 IP，
+# 或者打的是网站上本来不存在的路径（比如 /.env），不会两条都满足。只命中已知漏洞规则
+# （vpatch-*）的拦截不算，这类规则几乎不会误报。
+# 每行输出：路径、被拦的访客数、正常访问的访客数、命中的规则（逗号分隔）
+suspected_fps() {
+	[ "${MODE:-}" = full ] || return 0
+	local tmp logs=()
+	tmp=$(mktemp)
+	alerts_tsv 24h | awk -F'\t' '$1 == "waf"' >"$tmp"
+	if [ ! -s "$tmp" ]; then
+		rm -f "$tmp"
+		return 0
+	fi
+	mapfile -t logs < <(access_logs)
+	awk -F'\t' -v min="$FP_MIN" -v alerts="$tmp" '
+		# 第一个文件是拦截记录。native_rule:901xxx 是 CRS 的初始化规则，不是拦截原因
+		FILENAME == alerts {
+			path = $4
+			sub(/\?.*/, "", path)
+			n = split($5, r, ",")
+			targeted = 1
+			for (i = 1; i <= n; i++)
+				if (r[i] !~ /^crowdsecurity\/vpatch-/ && r[i] !~ /^native_rule:901/) targeted = 0
+			if (targeted || path == "") next
+			if (!((path, $2) in bip)) { bip[path, $2] = 1; blocked[path]++ }
+			# 列出命中的规则时，跳过 CRS 自己记分用的规则（初始化 901、判定 949/959、汇总 980）
+			for (i = 1; i <= n; i++)
+				if (r[i] !~ /^native_rule:(901|949|959|980)/ && !((path, r[i]) in hit)) {
+					hit[path, r[i]] = 1
+					rules[path] = rules[path] (rules[path] == "" ? "" : ",") r[i]
+				}
+			next
+		}
+		# 其余是 Nginx 访问日志（combined 格式）：IP 在最前面，请求和状态码在引号前后
+		{
+			split($0, q, "\"")
+			split(q[1], a, " ")
+			split(q[2], req, " ")
+			split(q[3], st, " ")
+			if (st[1] !~ /^[23]/) next
+			path = req[2]
+			sub(/\?.*/, "", path)
+			if (!(path in blocked)) next
+			if (!((path, a[1]) in seen)) { seen[path, a[1]] = 1; normal[path]++ }
+		}
+		END {
+			for (p in blocked)
+				if (blocked[p] >= min && normal[p] + 0 >= min)
+					printf "%s\t%d\t%d\t%s\n", p, blocked[p], normal[p], rules[p]
+		}
+	' "$tmp" ${logs[@]+"${logs[@]}"}
+	rm -f "$tmp"
+}
+
+rules_label() {
+	local r out=""
+	while IFS= read -r r; do
+		[ -n "$r" ] || continue
+		out="$out${out:+、}$(rule_label "$r")"
+	done < <(printf '%s\n' "$1" | tr ',' '\n')
+	printf '%s' "$out"
+}
+
+# 被拦访客最多的前 5 个可能误报，写成给人看的几行
+top_fps() {
+	local path blocked normal rules
+	suspected_fps | sort -t "$(printf '\t')" -k2,2nr | awk 'NR <= 5' |
+		while IFS=$'\t' read -r path blocked normal rules; do
+			printf '  %s：%s 个访客被拦截，同时有 %s 个访客正常打开过这个页面（%s）\n' \
+				"$(clean "$path")" "$blocked" "$normal" "$(rules_label "$rules")"
+		done
+}
+
+# 把攻击类型归成几大类，按次数从多到少，最多列 4 类
+attack_types() {
+	awk -F'\t' '
+		NF {
+			s = tolower($3)
+			if (s ~ /ssh/) c = "SSH 暴力破解"
+			else if (s ~ /env-access|git-config|sensitive|probing|scan|crawl|bad-user-agent|admin-interface/) c = "扫描和探测"
+			else if (s ~ /vpatch|cve|exploit/) c = "利用已知漏洞"
+			else if ($1 == "waf") c = "网站攻击（注入、XSS 等）"
+			else if (s ~ /bf|brute/) c = "暴力破解"
+			else c = "其他"
+			n[c]++
+		}
+		END { for (c in n) printf "%d\t%s\n", n[c], c }
+	' | sort -rn | awk -F'\t' 'NR <= 4 { printf "%s%s %d 次", (NR > 1 ? "，" : ""), $2, $1 }'
+}
+
+report_text() {
+	local tsv waf other ips bans types fps health="正常" svc
+	tsv=$(alerts_tsv 24h)
+	waf=$(printf '%s\n' "$tsv" | awk -F'\t' '$1 == "waf"' | grep -c . || true)
+	other=$(printf '%s\n' "$tsv" | awk -F'\t' 'NF && $1 != "waf"' | grep -c . || true)
+	ips=$(printf '%s\n' "$tsv" | awk -F'\t' 'NF && $2 != "" { print $2 }' | sort -u | grep -c . || true)
+	bans=$(cscli decisions list -o raw 2>/dev/null | tail -n +2 | grep -c . || true)
+	types=$(printf '%s\n' "$tsv" | attack_types)
+	fps=$(top_fps)
+	for svc in crowdsec crowdsec-firewall-bouncer; do
+		systemctl is-active --quiet "$svc" || health="异常，$svc 没有运行"
+	done
+	printf '【protect 防护日报】%s\n' "$(hostname 2>/dev/null || echo 服务器)"
+	printf '过去 24 小时：\n'
+	if [ "${waf:-0}" -eq 0 ] && [ "${other:-0}" -eq 0 ]; then
+		printf '· 没有发现攻击\n'
+	else
+		if [ "${waf:-0}" -gt 0 ]; then printf '· 网站防护拦截了 %s 个攻击请求\n' "$waf"; fi
+		if [ "${other:-0}" -gt 0 ]; then printf '· 识别出 %s 次攻击行为（扫描、暴力破解等）\n' "$other"; fi
+		printf '· 攻击来自 %s 个不同的 IP\n' "${ips:-0}"
+		if [ -n "$types" ]; then printf '· 主要攻击类型：%s\n' "$types"; fi
+	fi
+	printf '· 当前封禁 %s 个 IP\n' "${bans:-0}"
+	if [ -n "$fps" ]; then printf '· 可能的误报，登录服务器运行 sudo protect 处理：\n%s\n' "$fps"; fi
+	printf '· 防护状态：%s\n' "$health"
+}
+
+report() {
+	load_state
+	local text
+	text=$(report_text)
+	if [ "$send_report" -eq 1 ]; then
+		notify_send "$text" || die "日报发送失败"
+		say "日报已发送。"
+	else
+		say "$text"
+	fi
+}
+
+# 只接受钉钉、企业微信、飞书群机器人的官方地址，免得防护数据被发到别处
+notify_kind() {
+	case "$1" in
+	https://oapi.dingtalk.com/robot/send\?*) echo dingtalk ;;
+	https://qyapi.weixin.qq.com/cgi-bin/webhook/send\?*) echo wecom ;;
+	https://open.feishu.cn/open-apis/bot/v2/hook/*) echo feishu ;;
+	*) return 1 ;;
+	esac
+}
+
+notify_name() {
+	case "$1" in
+	dingtalk) printf '钉钉' ;;
+	wecom) printf '企业微信' ;;
+	feishu) printf '飞书' ;;
+	esac
+}
+
+notify_saved_url() {
+	(
+		# shellcheck disable=SC1090
+		. "$NOTIFY_FILE"
+		printf '%s' "${NOTIFY_URL:-}"
+	)
+}
+
+# 日报里有来自访客的内容（被拦的路径），按 JSON 规则转义，并去掉控制字符
+json_string() {
+	local s
+	s=$(printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037\177')
+	s=${s//\\/\\\\}
+	s=${s//\"/\\\"}
+	s=${s//$'\t'/\\t}
+	s=${s//$'\r'/}
+	s=${s//$'\n'/\\n}
+	printf '"%s"' "$s"
+}
+
+# 把一条消息发到设置好的群机器人。机器人地址里带着密钥，所以写进只有 root 能读的 curl
+# 配置文件，不出现在命令行（别的用户用 ps 能看到命令行）。关掉 Expect: 100-continue，
+# 消息超过 1KB 时不用多等一轮。
+# PROTECT_NOTIFY_ENDPOINT 只给测试用：把请求改发到本机的模拟服务器
+notify_send() {
+	[ -f "$NOTIFY_FILE" ] || die "还没有设置日报推送，先运行 sudo protect --notify"
+	local url kind tmp resp rc=0
+	url=$(notify_saved_url)
+	kind=$(notify_kind "$url") || die "保存的机器人地址无效，重新运行 sudo protect --notify"
+	tmp=$(mktemp -d)
+	case "$kind" in
+	feishu) printf '{"msg_type":"text","content":{"text":%s}}' "$(json_string "$1")" >"$tmp/body" ;;
+	*) printf '{"msgtype":"text","text":{"content":%s}}' "$(json_string "$1")" >"$tmp/body" ;;
+	esac
+	printf 'url = "%s"\n' "${PROTECT_NOTIFY_ENDPOINT:-$url}" >"$tmp/curl.conf"
+	resp=$(retry curl -sS --connect-timeout 10 -m 20 -K "$tmp/curl.conf" -H 'Content-Type: application/json' \
+		-H 'Expect:' --data-binary @"$tmp/body" 2>&1) || rc=$?
+	rm -rf "$tmp"
+	if [ "$rc" -ne 0 ]; then
+		warn "发送失败：$(clean "$resp")"
+		return 1
+	fi
+	# 成功时钉钉、企业微信返回 errcode 0，飞书返回 code 0 或 StatusCode 0
+	if [[ "$resp" =~ \"(errcode|code|StatusCode)\":[[:space:]]*0[,}] ]]; then return 0; fi
+	warn "机器人返回：$(clean "$resp")"
+	return 1
+}
+
+notify_setup() {
+	load_state
+	[ -x "$BIN" ] || install_command || die "需要先装好 protect 命令，重新运行一遍安装命令"
+	local url=$notify_url kind
+	if [ -z "$url" ]; then
+		have_tty || die "用法：sudo protect --notify <群机器人的 Webhook 地址>"
+		say "支持钉钉、企业微信、飞书的群机器人：在群设置里添加一个自定义机器人，复制它的 Webhook 地址。"
+		say "钉钉机器人的安全设置选\"自定义关键词\"，关键词填：防护"
+		printf '\n粘贴 Webhook 地址：' >/dev/tty
+		read -r url </dev/tty || true
+	fi
+	url=$(printf '%s' "$url" | tr -d '[:space:]')
+	kind=$(notify_kind "$url") || die "这不是钉钉、企业微信或飞书群机器人的 Webhook 地址"
+	[[ "$url" =~ ^[A-Za-z0-9:/._?=\&%-]+$ ]] || die "地址里有不该出现的字符，请检查是否复制完整"
+	(
+		umask 077
+		printf 'NOTIFY_URL=%q\n' "$url" >"$NOTIFY_FILE"
+	)
+	step "发送测试消息"
+	if ! notify_send "protect 防护日报推送已开启，之后每天早上 9 点左右发送前一天的防护情况。"; then
+		rm -f "$NOTIFY_FILE"
+		die "测试消息没有发出去，没有开启推送。检查地址是否完整；钉钉机器人要在安全设置里加关键词\"防护\""
+	fi
+	cat >"$REPORT_SERVICE" <<EOF
+# 由 protect 生成：把防护日报发到群机器人
+[Unit]
+Description=protect daily report
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$BIN --report --send
+EOF
+	cat >"$REPORT_TIMER" <<'EOF'
+# 由 protect 生成：每天早上 9 点左右发送防护日报
+[Unit]
+Description=protect daily report
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+	systemctl daemon-reload
+	systemctl enable --now protect-report.timer >/dev/null 2>&1
+	say "已开启：每天早上 9 点左右把防护日报发到$(notify_name "$kind")群。"
+}
+
+notify_off() {
+	systemctl disable --now protect-report.timer >/dev/null 2>&1 || true
+	rm -f "$REPORT_SERVICE" "$REPORT_TIMER" "$NOTIFY_FILE"
+	systemctl daemon-reload 2>/dev/null || true
+	say "已关闭每日简报推送。"
+}
+
+notify_status() {
+	if [ -f "$NOTIFY_FILE" ] && systemctl is-enabled --quiet protect-report.timer 2>/dev/null; then
+		say "每日简报：已开启，每天早上 9 点左右发到$(notify_name "$(notify_kind "$(notify_saved_url)")")群"
+	else
+		say "每日简报：未开启（sudo protect --notify 可以推送到钉钉、企业微信或飞书群）"
+	fi
 }
 
 # ---- protect 命令、更新和菜单 ----
@@ -622,8 +957,8 @@ latest_version() {
 # latest/download 或 download/vX.Y.Z。返回 1 表示下载失败，2 表示校验不通过
 fetch_release() {
 	local where=$1 dir=$2
-	retry curl -fsSL -o "$dir/protect.sh" "$RELEASES/$where/protect.sh" || return 1
-	retry curl -fsSL -o "$dir/SHA256SUMS" "$RELEASES/$where/SHA256SUMS" || return 1
+	retry curl -fsSL --connect-timeout 15 -m 120 -o "$dir/protect.sh" "$RELEASES/$where/protect.sh" || return 1
+	retry curl -fsSL --connect-timeout 15 -m 120 -o "$dir/SHA256SUMS" "$RELEASES/$where/SHA256SUMS" || return 1
 	(cd "$dir" && sha256sum --check --quiet SHA256SUMS >/dev/null 2>&1) || return 2
 }
 
@@ -690,14 +1025,18 @@ menu() {
 	load_state
 	# 从 0.1.0 升级上来的服务器还没有 protect 命令，顺手补上
 	[ -x "$BIN" ] || install_command >/dev/null 2>&1 || true
-	local latest choice ip n level
+	local latest choice ip n level fps
 	latest=$(latest_version)
+	fps=$(suspected_fps | grep -c . || true)
 	if [ "$MODE" = full ]; then level="完整"; else level="基础"; fi
 	while true; do
 		say ""
 		say "protect $VERSION · 防护级别：$level"
 		if [ -n "$latest" ] && version_gt "$latest" "$VERSION"; then
 			say "有新版本 $latest，选 5 更新"
+		fi
+		if [ "${fps:-0}" -gt 0 ]; then
+			say "发现 $fps 个页面可能被误拦，选 1 查看详情，选 2 放行"
 		fi
 		say ""
 		say "  1. 查看防护状态"
@@ -707,7 +1046,12 @@ menu() {
 		fi
 		say "  4. 解封一个 IP"
 		say "  5. 检查更新"
-		say "  6. 卸载"
+		if [ -f "$NOTIFY_FILE" ]; then
+			say "  6. 关闭每日简报推送"
+		else
+			say "  6. 每天把防护简报推送到钉钉、企业微信或飞书"
+		fi
+		say "  7. 卸载"
 		say "  0. 退出"
 		printf '\n请选择：' >/dev/tty
 		read -r choice </dev/tty || return 0
@@ -740,6 +1084,13 @@ menu() {
 			fi
 			;;
 		6)
+			if [ -f "$NOTIFY_FILE" ]; then
+				if confirm "关闭每日简报推送？"; then (notify_off) || true; fi
+			else
+				(notify_setup) || true
+			fi
+			;;
+		7)
 			(uninstall) || true
 			return 0
 			;;
@@ -1016,6 +1367,7 @@ uninstall() {
 	detect_os
 	confirm "将卸载 CrowdSec 和它的防护组件，网站会失去这层防护。确认吗？" || die "已取消"
 	step "卸载"
+	notify_off >/dev/null 2>&1 || true
 	if dpkg -s crowdsec-nginx-bouncer >/dev/null 2>&1 || rpm -q crowdsec-nginx-bouncer >/dev/null 2>&1; then
 		pkg_remove crowdsec-nginx-bouncer
 		if nginx -t >/dev/null 2>&1; then systemctl reload nginx; fi
@@ -1029,6 +1381,9 @@ case "$action" in
 install) do_install ;;
 menu) menu ;;
 update) update ;;
+report) report ;;
+notify) notify_setup ;;
+notify_off) notify_off ;;
 status) status ;;
 blocks) blocks ;;
 allow_block)

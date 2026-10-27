@@ -24,7 +24,7 @@ To pass options, put them after `bash -s --`, for example `... | sudo bash -s --
 It first lists what it is going to do and only starts after you confirm. The script's messages are in Chinese; translated, they look like this:
 
 ```
-protect 0.2.0 will do the following on this server:
+protect 0.3.0 will do the following on this server:
   System: Ubuntu 24.04 LTS · Web server: Nginx 1.24.0
   Protection level: full (requests are checked before they reach the site; attacks get a 403)
 
@@ -41,14 +41,15 @@ Protection comes from [CrowdSec](https://www.crowdsec.net). Step 4 finds the IP 
 The install also adds a `protect` command. Run `sudo protect` any time to open a menu, so there are no options to remember. Translated:
 
 ```
-protect 0.2.0 · Protection level: full
+protect 0.3.0 · Protection level: full
 
   1. Show protection status
   2. A legitimate user was blocked: review and allow
   3. Review or undo allowed exceptions
   4. Unban an IP
   5. Check for updates
-  6. Uninstall
+  6. Push a daily report to DingTalk, WeCom or Feishu
+  7. Uninstall
   0. Exit
 ```
 
@@ -72,7 +73,7 @@ sudo bash protect.sh
 gh attestation verify protect.sh --repo shianjeng/waf-lab
 ```
 
-To install a specific version, replace `latest/download` with `download/v0.2.0` in the URLs. `bash protect.sh --version` shows which version you have.
+To install a specific version, replace `latest/download` with `download/v0.3.0` in the URLs. `bash protect.sh --version` shows which version you have.
 
 ### Installing without GitHub access
 
@@ -123,6 +124,33 @@ To undo it, run sudo protect --exceptions and remove it by number.
 
 An exception only covers the rules that fired for that block. Other attacks on the same path, such as XSS or command injection, are still blocked.
 
+protect also spots likely false positives on its own. If, over the last 24 hours, at least 3 different visitors were blocked on a page and the Nginx access log shows at least 3 different visitors opening that same page normally, the menu, `--status` and the daily report flag it. Real attacks rarely meet both conditions: they come from a few IPs, or hit paths the site doesn't have, such as `/.env`. Blocks that only matched rules for known vulnerabilities (`vpatch-*`) are never flagged, since those rules almost never misfire. This needs full mode, because it compares blocks with the access log.
+
+### Daily report
+
+`sudo protect --report` summarizes the last 24 hours. Translated:
+
+```
+[protect daily report] web-01
+Last 24 hours:
+· Website protection blocked 128 attack requests
+· Detected 23 attacks (scanning, brute force and so on)
+· Attacks came from 37 different IPs
+· Main attack types: scanning and probing 30, SSH brute force 12, web attacks (injection, XSS and so on) 9
+· Currently banning 12 IPs
+· Possible false positives, log in to the server and run sudo protect:
+  /search: 5 visitors blocked, while 41 visitors opened this page normally (OWASP CRS rule 932250)
+· Protection status: OK
+```
+
+To get it in a group chat every morning, add a custom bot to a DingTalk, WeCom or Feishu group, copy its webhook URL, and run:
+
+```bash
+sudo protect --notify 'https://oapi.dingtalk.com/robot/send?access_token=...'
+```
+
+Or choose 6 in the menu and paste the URL. protect sends a test message first and only turns the report on if it arrives. For DingTalk bots, set the security option to a custom keyword and use `防护`, which every message contains. Only official DingTalk, WeCom and Feishu bot URLs are accepted. The URL contains the bot's key, so it's stored in a file only root can read. `sudo protect --notify-off` turns the report off.
+
 ### Options
 
 Run them as `sudo protect <option>`. With no option, `sudo protect` opens the menu.
@@ -135,7 +163,10 @@ Run them as `sudo protect <option>`. With no option, `sudo protect` opens the me
 | `--remove-exception N` | Undo the exception on one path, so those requests are blocked again |
 | `--unban IP` | Lift a ban on an IP, and optionally allowlist it |
 | `--reset-exceptions` | Remove all exceptions |
-| `--status` | Show whether protection is running and the latest attacks |
+| `--status` | Show whether protection is running, likely false positives and the latest attacks |
+| `--report` | Show the report for the last 24 hours; add `--send` to send it to the group bot |
+| `--notify [URL]` | Send the daily report to a DingTalk, WeCom or Feishu group bot |
+| `--notify-off` | Stop the daily report |
 | `--update` | Update to the latest version, keeping your settings and exceptions |
 | `--reinstall` | Run the install again with your current settings |
 | `--strict` | Also enable the OWASP CRS rules: more attacks blocked, but more false positives too (see the lab results below) |
@@ -154,6 +185,7 @@ Run them as `sudo protect <option>`. With no option, `sudo protect` opens the me
 
 - **It only protects.** The only requests it sends to your site are two to `127.0.0.1` at the end of the install, for the home page and for `/.env`, to confirm that blocking works. The menu and `--status` also fetch a few-byte `VERSION` file from GitHub to see whether a new version is out.
 - **It runs CrowdSec's official installer as root.** Step 1 downloads <https://install.crowdsec.net> and runs it to add the package repository, which is the installation method CrowdSec documents. As with any script you run with sudo, read `protect.sh` before running it.
+- **The daily report goes only where you send it.** Nothing is sent until you set it up with `--notify`. Each report contains the server's hostname, attack counts and types, and the paths of likely false positives.
 - **CrowdSec shares data with its community by default.** It sends the IPs and attack types it detects to the CrowdSec community and downloads the community blocklist in return. To opt out, see the [CrowdSec documentation](https://docs.crowdsec.net) on disabling the Central API.
 - **Servers in mainland China** download from CrowdSec's overseas package repository, which can be slow.
 - **The default rules are conservative.** By default only virtual patches for known vulnerabilities and a few generic rules are enabled. They rarely block legitimate traffic, but generic attacks such as path traversal need `--strict`.
@@ -162,7 +194,7 @@ Run them as `sudo protect <option>`. With no option, `sudo protect` opens the me
 ### Tests
 
 ```bash
-protect/test/run.sh            # 6 scenarios on servers simulated in Docker: install, menu, blocking, false positives, updates, uninstall
+protect/test/run.sh            # 6 scenarios on servers simulated in Docker: install, menu, blocking, false positives, daily report, updates, uninstall
 protect/test/run.sh rocky9     # just one
 ```
 
@@ -175,8 +207,8 @@ GitHub Actions runs ShellCheck on every push. It runs these scenarios in paralle
 Change `VERSION` in `protect/protect.sh`, commit, then push a matching tag:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 The release workflow runs all the test scenarios first. It only publishes `protect.sh`, `SHA256SUMS`, `VERSION` and the provenance attestation if they all pass and the tag matches `VERSION`.
@@ -290,7 +322,7 @@ curl -fsSL https://github.com/shianjeng/waf-lab/releases/latest/download/protect
 它会先列出要做的事情，你确认之后才会动手：
 
 ```
-protect 0.2.0 将要在这台服务器上做以下事情：
+protect 0.3.0 将要在这台服务器上做以下事情：
   系统：Ubuntu 24.04 LTS · Web 服务器：Nginx 1.24.0
   防护级别：完整（请求到达网站之前就检测，攻击请求直接返回 403）
 
@@ -307,14 +339,15 @@ protect 0.2.0 将要在这台服务器上做以下事情：
 安装时会顺便装一个 `protect` 命令。以后随时运行 `sudo protect` 就能打开管理菜单，不用记任何选项：
 
 ```
-protect 0.2.0 · 防护级别：完整
+protect 0.3.0 · 防护级别：完整
 
   1. 查看防护状态
   2. 正常用户被拦了，查看并放行
   3. 查看或撤销已放行的例外
   4. 解封一个 IP
   5. 检查更新
-  6. 卸载
+  6. 每天把防护简报推送到钉钉、企业微信或飞书
+  7. 卸载
   0. 退出
 ```
 
@@ -338,7 +371,7 @@ sudo bash protect.sh
 gh attestation verify protect.sh --repo shianjeng/waf-lab
 ```
 
-要安装指定版本，把网址里的 `latest/download` 换成 `download/v0.2.0`。`bash protect.sh --version` 可以查看当前版本。
+要安装指定版本，把网址里的 `latest/download` 换成 `download/v0.3.0`。`bash protect.sh --version` 可以查看当前版本。
 
 ### 不能访问 GitHub 时怎么安装
 
@@ -387,6 +420,33 @@ sudo protect --blocks
 
 放行只针对这次拦截命中的那几条规则。同一个路径上的其他攻击（比如 XSS、命令注入）仍然会被拦。
 
+protect 还会自己找出可能的误报：过去 24 小时里，如果某个页面上被拦的不同访客有 3 个以上，而 Nginx 访问日志显示同一个页面也有 3 个以上不同访客正常打开过，菜单、`--status` 和每日简报里都会提示。真正的攻击很少同时满足这两条：它们通常来自少数几个 IP，或者打的是网站上本来没有的路径（比如 `/.env`）。只命中已知漏洞规则（`vpatch-*`）的拦截不会被提示，这类规则几乎不会误报。这个功能要对比访问日志，所以只在完整模式下有。
+
+### 每日简报
+
+`sudo protect --report` 会汇总过去 24 小时的情况：
+
+```
+【protect 防护日报】web-01
+过去 24 小时：
+· 网站防护拦截了 128 个攻击请求
+· 识别出 23 次攻击行为（扫描、暴力破解等）
+· 攻击来自 37 个不同的 IP
+· 主要攻击类型：扫描和探测 30 次，SSH 暴力破解 12 次，网站攻击（注入、XSS 等） 9 次
+· 当前封禁 12 个 IP
+· 可能的误报，登录服务器运行 sudo protect 处理：
+  /search：5 个访客被拦截，同时有 41 个访客正常打开过这个页面（OWASP CRS 规则 932250）
+· 防护状态：正常
+```
+
+想每天早上在群里收到，就在钉钉、企业微信或飞书群里添加一个自定义机器人，复制它的 Webhook 地址，然后运行：
+
+```bash
+sudo protect --notify 'https://oapi.dingtalk.com/robot/send?access_token=...'
+```
+
+也可以在菜单里选 6，再粘贴地址。protect 会先发一条测试消息，发成功了才开启。钉钉机器人的安全设置选"自定义关键词"，关键词填 `防护`，每条消息里都有这两个字。只接受钉钉、企业微信、飞书机器人的官方地址。地址里带着机器人的密钥，所以保存在只有 root 能读的文件里。`sudo protect --notify-off` 可以关闭。
+
 ### 选项
 
 用法是 `sudo protect <选项>`。不加选项运行 `sudo protect` 会打开菜单。
@@ -399,7 +459,10 @@ sudo protect --blocks
 | `--remove-exception 编号` | 撤销某个路径上的放行，这类请求会重新被拦截 |
 | `--unban IP` | 解封一个被误封的 IP，可以顺便加入白名单 |
 | `--reset-exceptions` | 清除所有放行例外 |
-| `--status` | 查看防护状态和最近的攻击 |
+| `--status` | 查看防护状态、可能的误报和最近的攻击 |
+| `--report` | 显示过去 24 小时的防护简报，加 `--send` 发到群机器人 |
+| `--notify [地址]` | 每天把防护简报推送到钉钉、企业微信或飞书群机器人 |
+| `--notify-off` | 关闭每日简报推送 |
 | `--update` | 更新到最新版本，保留现有设置和放行例外 |
 | `--reinstall` | 按现有设置重新安装一遍 |
 | `--strict` | 额外启用 OWASP CRS 规则：拦得更多，误报也更多（见下面的实验室结果） |
@@ -418,6 +481,7 @@ sudo protect --blocks
 
 - **只做防护。** 它只会向你的网站发两个请求：安装结束时向本机 `127.0.0.1` 请求首页和 `/.env`，确认防护已经生效。菜单和 `--status` 还会从 GitHub 读取一个几字节的 `VERSION` 文件，看有没有新版本。
 - **它会用 root 权限运行 CrowdSec 的官方安装脚本。** 第 1 步会下载 <https://install.crowdsec.net> 并运行它来添加软件源，这是 CrowdSec 文档里的安装方式。和任何要用 sudo 运行的脚本一样，运行前请先看一遍 `protect.sh`。
+- **每日简报只发到你设置的地方。** 没有用 `--notify` 设置就不会发送任何内容。简报里有服务器的主机名、攻击的次数和类型，以及可能误报的页面路径。
 - **CrowdSec 默认会和社区共享数据。** 它会把检测到的攻击者 IP 和攻击类型分享给 CrowdSec 社区，同时下载社区黑名单。不想分享可以参考 [CrowdSec 文档](https://docs.crowdsec.net) 关闭 Central API。
 - **国内服务器** 安装时要从 CrowdSec 的国外软件源下载，可能比较慢。
 - **默认规则偏保守。** 默认只启用针对已知漏洞的虚拟补丁和少量通用规则，误报很少，但像路径穿越这种通用攻击要靠 `--strict`。
@@ -426,7 +490,7 @@ sudo protect --blocks
 ### 测试
 
 ```bash
-protect/test/run.sh            # 在 Docker 里模拟的服务器上跑 6 个场景：安装、菜单、拦截、误报处理、更新和卸载
+protect/test/run.sh            # 在 Docker 里模拟的服务器上跑 6 个场景：安装、菜单、拦截、误报处理、每日简报、更新和卸载
 protect/test/run.sh rocky9     # 只测一种
 ```
 
@@ -439,8 +503,8 @@ GitHub Actions 会在每次推送时用 ShellCheck 检查脚本；`protect/` 有
 修改 `protect/protect.sh` 里的 `VERSION`，提交，然后推送对应的标签：
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 发布工作流会先跑完所有测试场景。只有全部通过、并且标签和 `VERSION` 一致，才会发布 `protect.sh`、`SHA256SUMS`、`VERSION` 和来源证明。

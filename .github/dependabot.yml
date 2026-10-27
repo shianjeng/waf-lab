@@ -1,0 +1,33 @@
+# 每周检查一次依赖有没有新版本，有的话自动开升级 PR，CI 会在 PR 上跑测试。
+#
+# 没有覆盖到、需要手动检查的：
+#   coraza/Dockerfile、crowdsec/Dockerfile 里 xcaddy 插件的版本（@vX.Y.Z）
+#   scripts/bench.sh 里的 GoTestWAF 镜像版本
+#   safeline/compose.yaml（镜像名由变量拼成，Dependabot 读不了）和 scripts/init.sh 里的雷池版本
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # 实验室两个 Caddy 插件镜像的基础镜像
+  - package-ecosystem: docker
+    directories: [/coraza, /crowdsec]
+    schedule:
+      interval: weekly
+    groups:
+      caddy:
+        patterns: ["caddy"]
+
+  # 实验室里的 CrowdSec、BunkerWeb 和测试后端
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      # 本地构建的镜像，不在任何镜像仓库里
+      - dependency-name: "waf-lab/*"
