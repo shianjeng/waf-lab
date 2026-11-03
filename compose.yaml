@@ -43,7 +43,7 @@ services:
     depends_on: [backend]
 
   crowdsec:
-    image: crowdsecurity/crowdsec:v1.8.1
+    image: crowdsecurity/crowdsec:v1.8.2
     environment:
       COLLECTIONS: >-
         crowdsecurity/appsec-virtual-patching
