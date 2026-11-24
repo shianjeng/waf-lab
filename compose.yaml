@@ -79,7 +79,7 @@ services:
         condition: service_healthy
 
   bunkerweb:
-    image: bunkerity/bunkerweb-all-in-one:1.6.17
+    image: bunkerity/bunkerweb-all-in-one:1.6.18
     environment:
       SERVICE_UI: "no"
       SERVER_NAME: "localhost bunkerweb"
